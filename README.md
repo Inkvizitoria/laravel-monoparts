@@ -405,14 +405,36 @@ message: string (optional)
 - `CallbackFailed($payload, ?string $signature, Throwable $exception)`
 
 ## Винятки
-- `ConfigurationException` — відсутній `store_id` або `broker_id`.
-- `PayloadValidationException` — невірний payload (повертає `errors()`).
-- `ApiResponseException` — Monobank повернув 4xx/5xx (крім 409 для дубля).
-- `TransportException` — транспортна помилка HTTP.
-- `SignatureValidationException` — невірний підпис колбеку.
+- `MonoPartsException` — базовий клас для всіх помилок пакета (успадковує `RuntimeException`).
+- `ConfigurationException` — відсутній `store_id` або `broker_id`; кидається перед відправкою запиту.
+- `PayloadValidationException` — невірний payload; містить `errors(): array` з детальними помилками валідації.
+- `ApiResponseException` — Monobank повернув 4xx/5xx (крім 409 для дубля); містить `statusCode: int` і `exceptionResponse: ExceptionResponse` з полем `message`.
+- `TransportException` — транспортна помилка HTTP або непередбачений збій; містить `getPrevious()` з первинним ексепшеном.
+- `SignatureValidationException` — невірний підпис колбеку; використовується в CallbackProcessor.
+
+Приклад обробки:
+```php
+use Inkvizitoria\MonoParts\Exceptions\ApiResponseException;
+use Inkvizitoria\MonoParts\Exceptions\MonoPartsException;
+use Inkvizitoria\MonoParts\Exceptions\PayloadValidationException;
+use Inkvizitoria\MonoParts\Exceptions\TransportException;
+
+try {
+    $order = MonoParts::createOrder($payload);
+} catch (PayloadValidationException $e) {
+    $errors = $e->errors();
+} catch (ApiResponseException $e) {
+    $status = $e->statusCode;
+    $message = $e->exceptionResponse->message;
+} catch (TransportException $e) {
+    $previous = $e->getPrevious();
+} catch (MonoPartsException $e) {
+    // fallback for any other package exception
+}
+```
 
 ## Логи
-Логуються лише службові повідомлення (без payload). Канал задається в `monoparts.logging` і може бути перевизначений через `.env`.
+Логуються лише службові повідомлення (без payload). Канал задається в `monoparts.logging` і може бути перевизначений через `.env`. Якщо канал відсутній у `logging.channels`, пакет автоматично реєструє його на базі `monoparts.logging.channel_config`.
 
 ## Розширення
 - Власний підписувач: забіндьте `SignerInterface` у контейнері або використайте `signature.driver=custom`.
