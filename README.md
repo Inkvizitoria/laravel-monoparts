@@ -92,7 +92,7 @@ $order = MonoParts::createOrder([
     'products' => [
         ['name' => 'Телевізор', 'count' => 1, 'sum' => 1234.56],
     ],
-    'result_callback' => 'https://example.com/monoparts/result',
+    'result_callback' => 'https://example.com/monoparts/callback',
 ]);
 
 $paid = MonoParts::checkPaid($order->orderId);
@@ -143,7 +143,7 @@ Payload приклад:
     'products' => [
         ['name' => 'Товар', 'count' => 1, 'sum' => 100.25],
     ],
-    'result_callback' => 'https://example.com/callback',
+    'result_callback' => 'https://example.com/monoparts/callback',
     'financial_company_merchant_info' => [
         'edrpou_code' => '12345678',
         'iban_account' => 'UA123456789012345678901234567',
