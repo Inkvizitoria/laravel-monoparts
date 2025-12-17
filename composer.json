@@ -1,6 +1,7 @@
 {
     "name": "inkvizitoria/laravel-monoparts",
     "description": "Laravel package for monobank \"Покупка частинами\" integration (order lifecycle, callbacks, signing, logging) by Drozh Denis (DD).",
+    "version": "1.0.0",
     "type": "library",
     "license": "MIT",
     "authors": [
