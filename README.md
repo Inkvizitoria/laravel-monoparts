@@ -1,759 +1,380 @@
-# Laravel MonoParts cookbook
+# Laravel MonoParts
 
-Integrate monobank installment payments (Purchase in Parts) into a Laravel application. This guide follows a payment from checkout through customer approval, delivery, cancellation, refunds and financial reconciliation. It also covers guarantee letters, QR carts and broker eligibility checks.
+Laravel client for monobank Purchase in Parts (Покупка частинами). The package validates and signs requests, returns typed responses and provides a signed callback endpoint. It supports order creation, status checks, delivery confirmation, cancellation, refunds, reports, guarantee letters, QR carts and client/broker checks.
 
-The package provides signed HTTP requests, payload validation, typed responses and a callback endpoint. Your application owns its orders, payment records, inventory, delivery, refund ledger and background workers. The models and migrations below are application examples; the package does not create database tables.
+This cookbook explains how to use those operations in an existing Laravel application. No migrations, Eloquent models or application services are required by the package.
 
-For exact method signatures, DTO fields and settings, use the [reference](docs/reference.md). For an existing v1 integration, start with [UPGRADING.md](UPGRADING.md).
+**Requirements:** Laravel 12 with PHP 8.2+, or Laravel 13 with PHP 8.3+. For migration from version 1, see [UPGRADING.md](UPGRADING.md). Exact signatures, validation rules, DTO fields and configuration options are in the [reference](docs/reference.md).
 
 ## Contents
 
-1. [Install and configure the connection](#1-install-and-configure-the-connection)
-2. [Define the payment records](#2-define-the-payment-records)
-3. [Prepare and submit an order](#3-prepare-and-submit-an-order)
-4. [Receive callbacks and reconcile state](#4-receive-callbacks-and-reconcile-state)
-5. [Issue goods or cancel the purchase](#5-issue-goods-or-cancel-the-purchase)
-6. [Process a full or partial refund](#6-process-a-full-or-partial-refund)
-7. [Retrieve guarantee letters](#7-retrieve-guarantee-letters)
-8. [Reconcile orders and settlements](#8-reconcile-orders-and-settlements)
-9. [Use QR carts](#9-use-qr-carts)
-10. [Check client and broker eligibility](#10-check-client-and-broker-eligibility)
-11. [Handle errors and uncertain operations](#11-handle-errors-and-uncertain-operations)
-12. [Test and deploy the integration](#12-test-and-deploy-the-integration)
+1. [Install and connect](#1-install-and-connect)
+2. [Choose a client interface](#2-choose-a-client-interface)
+3. [Understand the payment flow](#3-understand-the-payment-flow)
+4. [Create an order](#4-create-an-order)
+5. [Receive callbacks and read state](#5-receive-callbacks-and-read-state)
+6. [Confirm delivery or cancel](#6-confirm-delivery-or-cancel)
+7. [Make a full or partial refund](#7-make-a-full-or-partial-refund)
+8. [Read order details and daily reports](#8-read-order-details-and-daily-reports)
+9. [Get guarantee letters](#9-get-guarantee-letters)
+10. [Create and cancel QR carts](#10-create-and-cancel-qr-carts)
+11. [Check clients and broker availability](#11-check-clients-and-broker-availability)
+12. [Handle errors and inspect events](#12-handle-errors-and-inspect-events)
+13. [Test the integration](#13-test-the-integration)
+14. [Use production credentials](#14-use-production-credentials)
 
-## 1. Install and configure the connection
+## 1. Install and connect
 
-Laravel 12 requires PHP 8.2+; Laravel 13 requires PHP 8.3+. Version 2 supports these two Laravel versions.
-
-Run in your Laravel application:
+Run in your Laravel project:
 
 ```bash
 composer require inkvizitoria/laravel-monoparts:^2.0
-php artisan vendor:publish --tag=monoparts-config
 ```
 
-Laravel discovers the package provider and facade automatically. Publishing creates `config/monoparts.php`; it preserves an existing file unless you pass `--force`.
-
-Start with credentials issued for the sandbox:
+Laravel discovers the service provider and facade automatically. Configure the credentials issued for your environment in `.env`:
 
 ```dotenv
-APP_URL=https://checkout.example.com
 MONOPARTS_ENV=sandbox
 MONOPARTS_STORE_ID=your-sandbox-store-id
 MONOPARTS_SIGNATURE_SECRET=your-sandbox-signing-secret
-MONOPARTS_TIMEOUT=30
-MONOPARTS_CONNECT_TIMEOUT=10
 ```
 
-The callback must be reachable by the bank over HTTPS. For local development, supply a public HTTPS address for your application and generate the callback URL from that address. A localhost URL cannot receive a bank callback.
+`MONOPARTS_ENV` accepts `sandbox`, `stage` or `production`; the default is `production`. Sandbox credentials do not select the sandbox automatically.
 
-The default hosts are `https://u2-demo-ext.mono.st4g3.com` for sandbox, `https://u2-ext.mono.st4g3.com` for stage and `https://u2.monobank.com.ua` for production. Select the environment that matches the credentials. Base URLs must use HTTPS. Keep credentials on the server; the browser submits a checkout request to your application, which calls the bank.
+| Environment | Default host |
+| --- | --- |
+| `sandbox` | `https://u2-demo-ext.mono.st4g3.com` |
+| `stage` | `https://u2-ext.mono.st4g3.com` |
+| `production` | `https://u2.monobank.com.ua` |
 
-Check the installed route:
+Publish configuration if you need to change callback settings, hosts, headers, signing or logging:
+
+```bash
+php artisan vendor:publish --tag=monoparts-config
+```
+
+This creates `config/monoparts.php`. Existing configuration is preserved unless you pass `--force`. Publishing is optional for the default setup.
+
+The package registers `POST /monoparts/callback`, named `monoparts.callback`, with the `api` middleware group. Check it with:
 
 ```bash
 php artisan route:list --name=monoparts.callback
 ```
 
-You should see `POST monoparts/callback`. The route uses Laravel's `api` middleware group. In `bootstrap/app.php`, retain your application's `withMiddleware(...)` configuration so Laravel registers its middleware groups. Keep authentication and browser CSRF middleware off this bank-facing route; the package verifies the bank's signature instead.
+For callbacks, your application needs a public HTTPS address. Configure `APP_URL` and your proxy/HTTPS settings so `route('monoparts.callback')` generates that address. During local development, use a public HTTPS tunnel or another reachable development host. The bank cannot call localhost. The callback uses signature verification; browser session authentication and CSRF middleware must not block it.
 
-The examples use dependency injection for application services and `app(MonoPartsClient::class)` for short action snippets. The `MonoParts` facade exposes the same methods. Choose one style in your application.
+## 2. Choose a client interface
 
-## 2. Define the payment records
-
-Keep your commercial order separate from its bank payment attempt. The identifiers have different purposes:
-
-| Identifier | Owner | Purpose |
-| --- | --- | --- |
-| `order_reference` | Your application | Find the commercial order, for example `ORDER-1001` |
-| Payment attempt `id` / `store_order_id` | Your application | Identify one immutable application to the bank; reuse it when recovering that application |
-| `bank_order_id` / bank `order_id` | Bank | Address state, delivery, cancellation, refund and document requests |
-| Refund `id` / `store_return_id` | Your application | Identify one refund; each separate refund has a separate ID |
-
-A failed customer application can have a new attempt after you establish that the old attempt is finished. A timeout alone does not justify a new attempt: the bank may already have accepted the previous one.
-
-### Create the example tables
-
-Generate a migration in the host application:
-
-```bash
-php artisan make:migration create_installment_payment_tables
-```
-
-Use this migration body. `order_reference` deliberately has no foreign key: replace it with your application's order relationship when integrating with an existing schema.
+The examples use the facade:
 
 ```php
-<?php
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
-use Illuminate\Support\Facades\Schema;
-
-return new class extends Migration {
-    public function up(): void
-    {
-        Schema::create('installment_payments', function (Blueprint $table): void {
-            $table->uuid('id')->primary();
-            $table->string('order_reference');
-            $table->unsignedInteger('attempt_no')->default(1);
-            $table->uuid('bank_order_id')->nullable()->unique();
-            $table->json('request_payload');
-            $table->string('status')->default('prepared');
-            $table->string('bank_state')->nullable();
-            $table->string('bank_sub_state')->nullable();
-            $table->timestamps();
-            $table->unique(['order_reference', 'attempt_no']);
-        });
-
-        Schema::create('monoparts_notifications', function (Blueprint $table): void {
-            $table->id();
-            $table->char('fingerprint', 64)->unique();
-            $table->uuid('bank_order_id')->index();
-            $table->json('payload');
-            $table->timestamp('processed_at')->nullable();
-            $table->timestamps();
-        });
-
-        Schema::create('installment_refunds', function (Blueprint $table): void {
-            $table->uuid('id')->primary();
-            $table->foreignUuid('payment_id')->constrained('installment_payments');
-            $table->unsignedBigInteger('amount_cents');
-            $table->boolean('return_money_to_card');
-            $table->string('status')->default('prepared');
-            $table->timestamps();
-        });
-    }
-
-    public function down(): void
-    {
-        Schema::dropIfExists('installment_refunds');
-        Schema::dropIfExists('monoparts_notifications');
-        Schema::dropIfExists('installment_payments');
-    }
-};
+$state = MonoParts::orderState('123e4567-e89b-12d3-a456-426614174000');
 ```
 
-Create `app/Models/InstallmentPayment.php`:
+The container provides the same client for dependency injection or direct resolution:
 
 ```php
-<?php
-
-namespace App\Models;
-
-use Illuminate\Database\Eloquent\Model;
-
-final class InstallmentPayment extends Model
-{
-    public $incrementing = false;
-    protected $keyType = 'string';
-    protected $guarded = [];
-    protected $casts = ['request_payload' => 'array'];
-}
-```
-
-Create `app/Models/MonopartsNotification.php`:
-
-```php
-<?php
-
-namespace App\Models;
-
-use Illuminate\Database\Eloquent\Model;
-
-final class MonopartsNotification extends Model
-{
-    protected $guarded = [];
-    protected $casts = ['payload' => 'array', 'processed_at' => 'datetime'];
-}
-```
-
-Create `app/Models/InstallmentRefund.php`:
-
-```php
-<?php
-
-namespace App\Models;
-
-use Illuminate\Database\Eloquent\Model;
-
-final class InstallmentRefund extends Model
-{
-    public $incrementing = false;
-    protected $keyType = 'string';
-    protected $guarded = [];
-    protected $casts = ['amount_cents' => 'integer', 'return_money_to_card' => 'boolean'];
-}
-```
-
-These models allow mass assignment so the examples stay focused on the payment workflow. Only pass server-built attributes to them. Never call `create($request->all())` or expose unrestricted updates to these records.
-
-```bash
-php artisan migrate
-```
-
-The unique order/attempt index prevents concurrent checkout requests from inserting the same logical attempt twice. The unique bank ID prevents one bank payment from being attached to two local attempts. The notification table provides a durable inbox for callbacks, including callbacks that arrive before the create response has been saved.
-
-## 3. Prepare and submit an order
-
-Run this step when the customer selects installments and submits checkout. Authenticate the customer, verify ownership of the commercial order, check stock and calculate prices from your catalog before preparing the bank request. Do not accept totals or unit prices directly from the browser.
-
-### Freeze the request before contacting the bank
-
-The example purchases one display for UAH 1,234.56. Amount strings are UAH; `1234.56` means 123,456 kopiykas. Product `sum` is a unit price, and `count` is the quantity. The supported part counts come from your merchant agreement, not an arbitrary customer value.
-
-In your checkout application service, prepare the attempt:
-
-```php
-use App\Models\InstallmentPayment;
-use Illuminate\Support\Str;
-
-$candidateId = (string) Str::uuid();
-
-$payment = InstallmentPayment::firstOrCreate(
-    ['order_reference' => 'ORDER-1001', 'attempt_no' => 1],
-    [
-        'id' => $candidateId,
-        'request_payload' => [
-            'store_order_id' => $candidateId,
-            'client_phone' => '+380500000001',
-            'total_sum' => '1234.56',
-            'invoice' => [
-                'date' => '2026-10-03',
-                'number' => 'INV-1001',
-                'source' => 'INTERNET',
-            ],
-            'available_programs' => [
-                ['available_parts_count' => [3, 6], 'type' => 'payment_installments'],
-            ],
-            'products' => [
-                ['name' => 'Display', 'count' => 1, 'sum' => '1234.56'],
-            ],
-            'result_callback' => route('monoparts.callback'),
-        ],
-    ],
-);
-```
-
-`firstOrCreate()` returns the existing attempt on a repeated checkout submission. The new candidate ID and payload are used only when inserting a record. Submit the returned record's saved payload, so a retry cannot change the original amount, invoice or callback address.
-
-Store decimal strings in the JSON snapshot. Although the client accepts `Money` instances, storing those objects directly through an Eloquent JSON cast does not produce an amount string.
-
-### Call the bank and save its ID
-
-Create `app/Services/SubmitInstallmentPayment.php`:
-
-```php
-<?php
-
-namespace App\Services;
-
-use App\Models\InstallmentPayment;
-use Illuminate\Support\Facades\Cache;
-use Inkvizitoria\MonoParts\Exceptions\ConfigurationException;
-use Inkvizitoria\MonoParts\Exceptions\PayloadValidationException;
 use Inkvizitoria\MonoParts\Http\MonoPartsClient;
-use Throwable;
 
-final class SubmitInstallmentPayment
-{
-    public function __construct(private readonly MonoPartsClient $mono)
-    {
-    }
-
-    public function submit(string $paymentId): InstallmentPayment
-    {
-        return Cache::lock('monoparts:create:' . $paymentId, 90)->block(5, function () use ($paymentId) {
-            $payment = InstallmentPayment::findOrFail($paymentId);
-            if ($payment->bank_order_id !== null) {
-                return $payment;
-            }
-
-            try {
-                $result = $this->mono->createOrder($payment->request_payload);
-            } catch (ConfigurationException|PayloadValidationException $e) {
-                $payment->update(['status' => 'create_failed']);
-                throw $e;
-            } catch (Throwable $e) {
-                $payment->update(['status' => 'create_uncertain']);
-                throw $e;
-            }
-
-            $payment->update([
-                'bank_order_id' => $result->orderId,
-                'status' => 'submitted',
-            ]);
-
-            return $payment->refresh();
-        });
-    }
-}
+$client = app(MonoPartsClient::class);
+$state = $client->orderState('123e4567-e89b-12d3-a456-426614174000');
 ```
 
-Call it with the prepared record:
+Use either interface in your existing controller, service, command or job. The package handles credentials, HTTP transport, validation and signing in both cases. You do not need to construct requests, calculate signatures or use a separate HTTP client for the operations below.
+
+Amounts are in UAH. Prefer decimal strings such as `'1234.56'`. Product `sum` is the unit price; `count` is the quantity. Integer `100` means UAH 100.00, not 100 kopiykas. To work with kopiykas explicitly:
 
 ```php
-use App\Services\SubmitInstallmentPayment;
+use Inkvizitoria\MonoParts\ValueObjects\Money;
 
-$payment = app(SubmitInstallmentPayment::class)->submit($payment->id);
-$bankOrderId = $payment->bank_order_id;
+$amount = Money::fromCents(123456);
+$amount->toDecimal(); // '1234.56'
+$amount->toCents();   // 123456
 ```
 
-Use a shared cache backend that supports atomic locks across your application instances. The 90-second lease exceeds the default 30-second HTTP timeout; adjust both together if you increase the timeout. The lock limits concurrent submission; the saved merchant ID and bank duplicate detection remain necessary if a process dies or a lease expires. Keep the bank call outside a database transaction so network latency does not hold row locks.
+The client accepts `Money`, integers, floats and decimal strings for monetary fields. It rejects extra decimal precision rather than silently rounding. It sends amounts as JSON numbers and signs exactly the bytes sent. See [monetary limits](docs/reference.md#monetary-values).
 
-The returned ID means the bank accepted the application for processing. The customer still needs to approve it in the bank app. Show a pending-payment screen and continue with state processing below. Do not issue goods based on the create response.
+## 3. Understand the payment flow
 
-On an order-creation duplicate, the bank can return HTTP 409 and the existing `order_id`; the package returns a normal `CreateOrderResult`. If a create request times out, recover by deliberately resubmitting the same saved payload and `store_order_id`, then save the returned ID. Do not generate a replacement ID or assume the first call failed.
+The usual flow is:
 
-## 4. Receive callbacks and reconcile state
+1. Call `createOrder()` when the customer chooses installments at checkout.
+2. Receive a bank `orderId`. The application is now being processed; it is not yet proof of payment completion.
+3. Receive signed callbacks, or call `orderState()` to check progress while the customer approves the purchase in the bank app.
+4. If your merchant flow requires store confirmation, wait for `WAITING_FOR_STORE_CONFIRM`, issue the goods and call `confirmOrder()`.
+5. Use `rejectOrder()` for cancellation before delivery, or `returnOrder()` for a return after delivery.
+6. Use `orderData()` for order details and recorded returns, and `storeReport()` for financial reconciliation.
 
-A successful create request starts an asynchronous process. The bank sends an order-state callback to the saved `result_callback`. Your application must turn that notification into a durable local state update.
+Some merchants do not require store confirmation. Follow the flow enabled for your merchant agreement; do not add a confirmation call to every successful callback.
 
-### Define one state applicator
+Keep these identifiers distinct:
 
-Both callback processing and scheduled polling should use the same transition rules. Create `app/Services/ApplyInstallmentState.php`:
+| Identifier | Supplied by | Use |
+| --- | --- | --- |
+| `store_order_id` | Your application | Identify one order-creation attempt; reuse it when recovering the same attempt |
+| `orderId` / bank `order_id` | Bank | Address state, confirmation, cancellation, refunds and documents |
+| `storeReturnId` / `store_return_id` | Your application | Identify one return operation; a separate return gets a separate ID |
+| QR `id` | Bank | Identify the created cart; it is not automatically an installment order ID |
+| `qr_id` | Bank/merchant QR setup | Select the store QR for cart creation and cancellation |
+
+Retain the bank order ID with your existing order/payment data. The package returns IDs but does not store them. A timeout may occur after the bank has acted: retain the original merchant ID and payload for recovery instead of creating a new payment attempt automatically.
+
+## 4. Create an order
+
+Call `createOrder()` with an associative array. The example creates a UAH 1,234.56 purchase with a choice of three or six installments:
 
 ```php
-<?php
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-namespace App\Services;
+$payload = [
+    'store_order_id' => 'ORDER-1001-ATTEMPT-1',
+    'client_phone' => '+380500000001',
+    'total_sum' => '1234.56',
+    'invoice' => [
+        'date' => '2026-10-03',
+        'number' => 'INV-1001',
+        'source' => 'INTERNET',
+    ],
+    'available_programs' => [
+        ['type' => 'payment_installments', 'available_parts_count' => [3, 6]],
+    ],
+    'products' => [
+        ['name' => 'Display', 'count' => 1, 'sum' => '1234.56'],
+    ],
+    'result_callback' => route('monoparts.callback'),
+];
 
-use App\Models\InstallmentPayment;
-use Illuminate\Support\Facades\DB;
-use Inkvizitoria\MonoParts\Enums\OrderState;
-use Inkvizitoria\MonoParts\Enums\OrderSubState;
-use Inkvizitoria\MonoParts\Http\Responses\OrderStateInfo;
-use LogicException;
-
-final class ApplyInstallmentState
-{
-    public function apply(OrderStateInfo $info): InstallmentPayment
-    {
-        return DB::transaction(function () use ($info) {
-            $payment = InstallmentPayment::where('bank_order_id', $info->orderId)
-                ->lockForUpdate()->firstOrFail();
-
-            $terminal = in_array($payment->bank_state, ['SUCCESS', 'FAIL'], true);
-            if ($terminal && $info->state === OrderState::IN_PROCESS) {
-                return $payment;
-            }
-            if ($terminal && ($info->state === null || $payment->bank_state !== $info->state->value)) {
-                throw new LogicException('Conflicting terminal bank states require reconciliation.');
-            }
-
-            $status = match ($info->state) {
-                OrderState::SUCCESS => 'completed',
-                OrderState::FAIL => 'declined',
-                OrderState::IN_PROCESS => $info->orderSubState === OrderSubState::WAITING_FOR_STORE_CONFIRM
-                    ? 'ready_for_delivery' : 'pending',
-                null => 'review',
-            };
-
-            $payment->update([
-                'status' => $status,
-                'bank_state' => $info->rawState,
-                'bank_sub_state' => $info->rawOrderSubState,
-            ]);
-
-            return $payment->refresh();
-        });
-    }
-}
+$created = MonoParts::createOrder($payload);
+$bankOrderId = $created->orderId;
 ```
 
-`completed` here means the installment application reached bank state `SUCCESS`. It does not mean the customer has repaid all installments or that a bank transfer has reached your account. Those are separate checks in the refund and reconciliation recipes.
+`CreateOrderResult::orderId` is a bank UUID. Use that value for subsequent order operations. The examples below use `123e4567-e89b-12d3-a456-426614174000` as a sample bank ID; replace it with the returned value.
 
-The applicator preserves unknown raw states for investigation, prevents a delayed pending snapshot from replacing a terminal state, and refuses contradictory terminal states. Refund progress belongs in the refund ledger; do not erase a completed payment record after a partial return.
+Build prices and product information from your existing checkout data on the server. Use the part counts agreed with the bank. `invoice.source` is `INTERNET`, `STORE` or `CHECKOUT`, according to the purchase channel. Phone numbers must use `+380` followed by nine digits. Arrays for products, programs and part counts must be non-empty lists.
 
-### Save verified callbacks before acknowledging them
+`result_callback` is optional in the API payload. Supply it when using the package's callback route. The route receives the bank result; it is not a URL that the customer opens after checkout. Show your own pending-payment screen while waiting for the result.
 
-Listen to `CallbackValidated`, which the package emits after checking the original body signature and validating its fields. Do not update orders from `CallbackReceived` or from a browser payment-result page.
+### Optional order fields
 
-Create `app/Listeners/CaptureMonopartsCallback.php`:
+Add only the fields your merchant integration uses:
 
 ```php
-<?php
+$payload['invoice']['point_id'] = 'outlet-1';
+$payload['additional_params'] = [
+    'nds' => '0.00',
+    'ext_initial_sum' => '100.00',
+    'seller_phone' => '+380500000002',
+];
+$payload['financial_company_merchant_info'] = [
+    'edrpou_code' => '12345678',
+    'iban_account' => 'UA123456789012345678901234567',
+    'store_name' => 'Example Store',
+];
+```
 
-namespace App\Listeners;
+This block modifies the payload **before** calling `createOrder()`. `nds` is VAT and `ext_initial_sum` is an initial payment. Confirm their use and the merchant details with the bank; local validation does not determine eligibility or bank accounting rules. All supported fields and limits are listed in the [payload reference](docs/reference.md#create-order-payload).
 
-use App\Jobs\ProcessMonopartsNotification;
-use App\Models\MonopartsNotification;
+### Duplicate creation and timeouts
+
+For a duplicate create, the bank can return HTTP 409 with the existing `order_id`. The package maps that response to a normal `CreateOrderResult`; it does not require catching a conflict exception.
+
+After a create timeout, deliberately resubmit the **same saved payload and `store_order_id`** to recover the existing bank ID. Do not generate a new ID, change prices or change invoice data for that recovery. A new customer application after an established rejection is a separate attempt and should have a separate merchant ID.
+
+The duplicate normalization applies only to `createOrder()`. It does not establish a general retry guarantee for refunds, confirmations or QR writes.
+
+## 5. Receive callbacks and read state
+
+The package verifies the original callback body signature, validates the payload and dispatches `CallbackValidated`. Use this event to connect the result to your existing order handling.
+
+Register a listener in the `boot()` method of your existing `AppServiceProvider`:
+
+```php
+use Illuminate\Support\Facades\Event;
 use Inkvizitoria\MonoParts\Events\CallbackValidated;
 
-final class CaptureMonopartsCallback
-{
-    public function handle(CallbackValidated $event): void
-    {
-        $payload = [
-            'order_id' => $event->payload['order_id'],
-            'state' => $event->payload['state'],
-            'order_sub_state' => $event->payload['order_sub_state'] ?? null,
-            'message' => $event->payload['message'] ?? null,
-        ];
-        $fingerprint = hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR));
-        $notification = MonopartsNotification::firstOrCreate(
-            ['fingerprint' => $fingerprint],
-            ['bank_order_id' => $payload['order_id'], 'payload' => $payload],
-        );
+Event::listen(CallbackValidated::class, function (CallbackValidated $event): void {
+    $bankOrderId = $event->stateInfo?->orderId;
+    $state = $event->stateInfo?->state;
+    $subState = $event->stateInfo?->orderSubState;
+    $message = $event->stateInfo?->message;
 
-        if ($notification->processed_at === null) {
-            ProcessMonopartsNotification::dispatch($notification->id)
-                ->onQueue('payments')->afterCommit();
-        }
-    }
-}
+    // Pass these values to your existing order/payment handling.
+});
 ```
 
-The listener is synchronous: its database write completes before the package returns HTTP 200. Do not add `ShouldQueue` to this inbox-capture listener. If persistence fails, let the exception reach the callback processor, which returns HTTP 500. If dispatch fails after saving, the inbox record remains available for recovery.
+The event also exposes `$event->payload` with the validated bank field names and `$event->signature`. `state` and `orderSubState` are enums; their string values are available through `->value`. Unknown sub-states remain available as `stateInfo->rawOrderSubState`.
 
-Add this explicit registration to your existing `AppServiceProvider::boot()` in `app/Providers/AppServiceProvider.php`:
+The endpoint responds with HTTP 200 after validation and synchronous listeners complete. A missing or invalid signature gets 403; invalid JSON or payload gets 400; a processing/listener failure gets 500. The callback route and validation are supplied by the package; you do not need another callback controller.
+
+Keep callback handling short. Record the result in your existing application flow before returning successfully, and make repeated notifications harmless. If you delegate work to a queue, configure that queue in your application and retain enough information to recover failed dispatch or processing. The HTTP acknowledgement is not proof that a queued job has completed.
+
+A callback can arrive before your create-response handling finishes. Match callbacks by the bank order ID and account for this timing. Do not issue goods again on duplicate notifications or regress a completed payment because an older pending notification arrives.
+
+### Query the current state
+
+Use `orderState()` when you need the latest bank state, missed a callback or are investigating a pending operation:
 
 ```php
-\Illuminate\Support\Facades\Event::listen(
-    \Inkvizitoria\MonoParts\Events\CallbackValidated::class,
-    \App\Listeners\CaptureMonopartsCallback::class,
-);
-```
-
-For this explicit-registration example, create the listener manually and prevent Laravel from also discovering it. In `bootstrap/app.php`, use `->withEvents(discover: false)` on the existing application builder. If your application uses event discovery for other listeners, keep discovery and omit the explicit registration instead. Check `php artisan event:list` to ensure this listener appears once.
-
-### Process the inbox asynchronously
-
-Create `app/Jobs/ProcessMonopartsNotification.php`:
-
-```php
-<?php
-
-namespace App\Jobs;
-
-use App\Models\InstallmentPayment;
-use App\Models\MonopartsNotification;
-use App\Services\ApplyInstallmentState;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Queue\Queueable;
-use Illuminate\Queue\Middleware\WithoutOverlapping;
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
-
-final class ProcessMonopartsNotification implements ShouldQueue
-{
-    use Queueable;
-
-    public int $tries = 10;
-    public int $timeout = 45;
-
-    public function __construct(public readonly int $notificationId)
-    {
-    }
-
-    public function backoff(): array
-    {
-        return [10, 30, 60, 120];
-    }
-
-    public function middleware(): array
-    {
-        $bankId = MonopartsNotification::findOrFail($this->notificationId)->bank_order_id;
-
-        return [(new WithoutOverlapping('monoparts:state:' . $bankId))
-            ->shared()->releaseAfter(10)->expireAfter(60)];
-    }
-
-    public function handle(MonoPartsClient $mono, ApplyInstallmentState $states): void
-    {
-        $notification = MonopartsNotification::findOrFail($this->notificationId);
-        if ($notification->processed_at !== null) {
-            return;
-        }
-        if (!InstallmentPayment::where('bank_order_id', $notification->bank_order_id)->exists()) {
-            $this->release(10);
-            return;
-        }
-
-        $current = $mono->orderState($notification->bank_order_id);
-        $states->apply($current);
-        $notification->update(['processed_at' => now()]);
-    }
-}
-```
-
-This recipe treats the callback as a notification to fetch the bank's current state. It adds a state request, but avoids applying an old callback as if it were the latest snapshot. The per-bank-order lock serializes inbox jobs; terminal-state guards also protect against slower polling requests. If your integration applies the callback payload directly instead, retain the same transition guards and a recovery path for out-of-order notifications.
-
-A callback can arrive before `bank_order_id` has been saved locally. The inbox captures it, and the job waits for the mapping. Unknown orders remain unprocessed for investigation instead of disappearing. If a job exhausts its attempts, its inbox row still exists.
-
-Configure an asynchronous queue connection such as database or Redis. With the `sync` connection, the job runs in the callback request and the intended asynchronous separation is lost. Start a worker for this queue:
-
-```bash
-php artisan queue:work --queue=payments --timeout=45 --tries=10
-```
-
-Set the connection's `retry_after` above the worker timeout, for example 90 seconds for this recipe. The job timeout must exceed the configured bank request timeout. Supervise the worker in production. See Laravel's [queue transaction handling](https://laravel.com/docs/12.x/queues#jobs-and-database-transactions) and [worker timeout guidance](https://laravel.com/docs/12.x/queues#job-expirations-and-timeouts).
-
-Emails, inventory changes and delivery actions must be idempotent too. For external side effects, write an application outbox entry in the same database transaction as the state change, then deliver it independently with a unique operation key. A database transaction cannot undo an email or a warehouse API call.
-
-### Interpret the next action
-
-| Observed bank state | Meaning for this integration | Next action |
-| --- | --- | --- |
-| `IN_PROCESS` / `WAITING_FOR_CLIENT` | Customer approval is still pending | Keep the checkout pending; wait or poll |
-| `IN_PROCESS` / `WAITING_FOR_STORE_CONFIRM` | Store confirmation is required | Issue goods through your authorized fulfillment process, then confirm |
-| `SUCCESS` | Application completed successfully | Record completion; avoid duplicate fulfillment |
-| `FAIL` | Application was rejected or cancelled | Record the reason; release reservations according to your order policy |
-| Unknown state or conflicting terminal result | Automatic processing cannot determine a safe transition | Hold fulfillment and reconcile with the bank |
-
-A merchant that does not use store confirmation can reach `SUCCESS` without calling `confirmOrder()`. Use the flow enabled for your merchant agreement. Do not automatically call confirmation whenever any callback arrives.
-
-## 5. Issue goods or cancel the purchase
-
-Delivery and cancellation are explicit business actions. Call these methods from an authorized fulfillment service or staff action, using the stored bank ID. A callback updates payment state; it does not establish that the warehouse actually handed over goods.
-
-### Confirm issuance
-
-For a merchant using store confirmation, verify that the latest bank state is `WAITING_FOR_STORE_CONFIRM`, perform your controlled issuance step and send confirmation:
-
-```php
-use App\Services\ApplyInstallmentState;
+use Inkvizitoria\MonoParts\Enums\OrderState;
 use Inkvizitoria\MonoParts\Enums\OrderSubState;
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-$mono = app(MonoPartsClient::class);
-$current = $mono->orderState($payment->bank_order_id);
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$state = MonoParts::orderState($bankOrderId);
 
-if ($current->orderSubState !== OrderSubState::WAITING_FOR_STORE_CONFIRM) {
-    throw new \LogicException('This payment is not waiting for store confirmation.');
-}
-
-// Call confirmOrder after your application records that goods were issued.
-$confirmed = $mono->confirmOrder($payment->bank_order_id);
-app(ApplyInstallmentState::class)->apply($confirmed);
+$isCompleted = $state->state === OrderState::SUCCESS;
+$isDeclined = $state->state === OrderState::FAIL;
+$isWaitingForStore = $state->state === OrderState::IN_PROCESS
+    && $state->orderSubState === OrderSubState::WAITING_FOR_STORE_CONFIRM;
+$bankMessage = $state->message;
 ```
 
-Protect the local issuance action with a per-order lock and an idempotent fulfillment record. If confirmation times out after goods were issued, leave the issuance record intact and mark confirmation as unresolved. Query `orderState()` before deciding whether another confirmation request is needed. Do not release the goods a second time because a network call failed.
+Callbacks and state queries use the same `OrderStateInfo` DTO:
 
-The API result is still an `OrderStateInfo`; inspect the state rather than treating every HTTP 200 as final success. The applicator also handles a response that remains `IN_PROCESS`.
+| State | Meaning | Typical action |
+| --- | --- | --- |
+| `IN_PROCESS` / `WAITING_FOR_CLIENT` | Customer approval is pending | Wait for a callback or check state later |
+| `IN_PROCESS` / `WAITING_FOR_STORE_CONFIRM` | Store confirmation is required | Issue goods through your fulfillment flow, then confirm |
+| `SUCCESS` | Bank application completed successfully | Record completion in your existing payment flow |
+| `FAIL` | Bank application rejected or cancelled | Read the sub-state/message and handle the rejection |
+| `state === null` in an HTTP response | Bank returned an unrecognized high-level state | Inspect `rawState`; reconcile before fulfillment |
+
+`SUCCESS` does not mean the customer has repaid every installment or that a settlement transfer has arrived. Use `checkPaid()` and `storeReport()` for those separate questions.
+
+Polling makes HTTP calls to the bank. Use bounded intervals and backoff in your existing background processing rather than repeatedly calling the bank from a tight loop. When local and bank terminal states conflict, investigate instead of overwriting the result automatically.
+
+## 6. Confirm delivery or cancel
+
+### Confirm goods were issued
+
+Use `confirmOrder()` in a merchant flow that requires store confirmation. Check the current state before issuing goods; send confirmation after your application has recorded issuance:
+
+```php
+use Inkvizitoria\MonoParts\Enums\OrderState;
+use Inkvizitoria\MonoParts\Enums\OrderSubState;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$current = MonoParts::orderState($bankOrderId);
+
+if ($current->state !== OrderState::IN_PROCESS
+    || $current->orderSubState !== OrderSubState::WAITING_FOR_STORE_CONFIRM) {
+    throw new \LogicException('Order is not waiting for store confirmation.');
+}
+
+// Issue the goods and record issuance in your existing fulfillment flow first.
+$confirmed = MonoParts::confirmOrder($bankOrderId);
+$bankState = $confirmed->state;
+```
+
+The result is an `OrderStateInfo`, not a boolean. Inspect its state; an HTTP 200 does not by itself establish a terminal result.
+
+If confirmation times out after issuance, query `orderState()` before deciding whether to repeat confirmation. The warehouse action and the bank call are separate operations: a failed HTTP call must not cause the goods to be handed over twice.
 
 ### Cancel before delivery
 
-When the purchase is abandoned or your store cannot issue the goods, cancel the bank application before delivery:
+Call `rejectOrder()` when abandoning an application before delivery:
 
 ```php
-use App\Services\ApplyInstallmentState;
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-$cancelled = app(MonoPartsClient::class)->rejectOrder($payment->bank_order_id);
-app(ApplyInstallmentState::class)->apply($cancelled);
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$cancelled = MonoParts::rejectOrder($bankOrderId);
+$bankState = $cancelled->state;
+$reason = $cancelled->message;
 ```
 
-Check your own issuance record before calling this action and serialize it with fulfillment. The bank decides whether cancellation is allowed for the current state. After delivery, use the refund recipe instead. A customer declining the bank application can also produce `FAIL` without a store cancellation call.
+The bank determines whether cancellation is allowed in the current state. Coordinate this action with your existing fulfillment process so cancellation and issuance cannot run concurrently. After delivery, use a refund rather than pre-delivery cancellation.
 
-## 6. Process a full or partial refund
+## 7. Make a full or partial refund
 
-Use `returnOrder()` after delivery when the goods are returned. A full refund uses the remaining refundable amount; a partial refund uses the amount of the returned goods. Each refund operation gets its own stable merchant refund ID.
+Use `returnOrder()` after delivery when returning goods. The amount determines whether the return is full or partial; there is no separate full-refund method.
 
-### Decide who returns the money
-
-Check the bank's flags before choosing the refund channel:
+### Check repayment and card-return availability
 
 ```php
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-$mono = app(MonoPartsClient::class);
-$paid = $mono->checkPaid($payment->bank_order_id);
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$paid = MonoParts::checkPaid($bankOrderId);
 
-$customerHasRepaidAllInstallments = $paid->fullyPaid;
-$bankCanReturnToCard = $paid->bankCanReturnMoneyToCard;
+$fullyRepaid = $paid->fullyPaid;
+$cardReturnAvailable = $paid->bankCanReturnMoneyToCard;
 ```
 
-`fullyPaid` describes whether the customer has repaid the installment application. It is not the same as the `SUCCESS` state from order processing.
+`fullyPaid` refers to the customer's repayment of the installment application. `bankCanReturnMoneyToCard` tells you whether a bank card return is available. These flags answer different questions.
 
-For `returnMoneyToCard=true`, the bank is asked to return money to the customer's card. For `false`, the bank's contract says the store has already returned cash to the customer. If the bank cannot return money to the card, do not silently switch the flag to `false`: arrange and record the permitted refund procedure first. See the bank's [refund request schema](https://u2-demo-ext.mono.st4g3.com/v2/api-docs).
+### Submit a card refund
 
-### Reserve the amount in your local ledger
-
-In an authorized refund service, accept an existing server-issued refund operation ID when resuming a refund. Generate a new ID only for a new return of goods. The following example reserves UAH 100.00 for a new card refund:
+The example returns UAH 100.00 to the customer's card:
 
 ```php
-use App\Models\InstallmentPayment;
-use App\Models\InstallmentRefund;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Str;
-use Inkvizitoria\MonoParts\ValueObjects\Money;
-
-$refundId = (string) Str::uuid();
-$amount = Money::fromDecimal('100.00');
-$returnMoneyToCard = true;
-
-if ($returnMoneyToCard && !$bankCanReturnToCard) {
-    throw new \LogicException('A card refund is unavailable; reconcile the refund channel first.');
-}
-
-$refund = DB::transaction(function () use ($payment, $refundId, $amount, $returnMoneyToCard) {
-    $locked = InstallmentPayment::whereKey($payment->id)->lockForUpdate()->firstOrFail();
-    if ($locked->bank_order_id === null || $locked->bank_state !== 'SUCCESS' || $amount->toCents() < 1) {
-        throw new \LogicException('A completed bank application and a positive refund amount are required.');
-    }
-
-    $reservedCents = (int) InstallmentRefund::where('payment_id', $locked->id)
-        ->whereIn('status', ['prepared', 'accepted', 'uncertain'])
-        ->sum('amount_cents');
-    $totalCents = Money::fromNumber($locked->request_payload['total_sum'])->toCents();
-    if ($amount->toCents() > $totalCents - $reservedCents) {
-        throw new \LogicException('Refund amount exceeds the unreserved payment amount.');
-    }
-
-    return InstallmentRefund::create([
-        'id' => $refundId,
-        'payment_id' => $locked->id,
-        'amount_cents' => $amount->toCents(),
-        'return_money_to_card' => $returnMoneyToCard,
-    ]);
-});
-```
-
-The locked payment row serializes reservations from your application. Pending and uncertain refunds reserve money too; otherwise a second operator could refund an amount that is already being processed. The bank remains the authority for the amount actually returnable. If you also perform refunds outside this application, reconcile those returns before trusting the local balance.
-
-### Resume an existing reservation
-
-Load the operation issued by your server, within the payment the current user is authorized to refund. Reuse its amount and channel; do not generate another ID or reserve the amount again:
-
-```php
-use App\Models\InstallmentRefund;
-
-// Authorize this payment before resolving a submitted refund operation ID.
-$refund = InstallmentRefund::where('payment_id', $payment->id)
-    ->whereKey($existingRefundId)->firstOrFail();
-
-if ($refund->status !== 'prepared') {
-    // Accepted or uncertain operations go to reconciliation, not another submission.
-    throw new \LogicException('This refund has already been submitted; reconcile its result.');
-}
-```
-
-The submission below reads the saved amount and channel. It checks the status again under the refund lock because another worker may have submitted the same operation after it was loaded.
-
-### Submit the reserved refund once
-
-Use the saved ledger record, then inspect the business status:
-
-```php
-use Illuminate\Support\Facades\Cache;
 use Inkvizitoria\MonoParts\Enums\ReturnStatus;
-use Inkvizitoria\MonoParts\ValueObjects\Money;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-Cache::lock('monoparts:refund:' . $refund->id, 90)->block(5, function () use ($refund, $payment, $mono) {
-    $refund->refresh();
-    if ($refund->status !== 'prepared') {
-        return;
-    }
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$refundId = 'RETURN-1001-1';
+$paid = MonoParts::checkPaid($bankOrderId);
 
-    $refund->update(['status' => 'uncertain']);
-    $result = $mono->returnOrder(
-        orderId: $payment->bank_order_id,
-        sum: Money::fromCents($refund->amount_cents),
-        returnMoneyToCard: $refund->return_money_to_card,
-        storeReturnId: $refund->id,
-    );
+if (!$paid->bankCanReturnMoneyToCard) {
+    throw new \LogicException('The bank cannot return this amount to the card.');
+}
 
-    $refund->update([
-        'status' => $result->status === ReturnStatus::OK ? 'accepted' : 'uncertain',
-    ]);
-});
+$return = MonoParts::returnOrder(
+    orderId: $bankOrderId,
+    sum: '100.00',
+    returnMoneyToCard: true,
+    storeReturnId: $refundId,
+);
+
+$accepted = $return->status === ReturnStatus::OK;
+$rawStatus = $return->rawStatus;
 ```
 
-Marking the record uncertain before transport also covers a process crash after sending. A thrown exception leaves that reservation intact. A non-`OK` or unknown return status requires investigation; the example does not release the reservation based on an unfamiliar response.
+Use the stable ID of this return from your existing return/refund workflow. A second, separate partial return needs its own ID. A full return uses the remaining refundable amount, accounting for previous returns and unresolved operations; the package does not calculate this balance.
 
-`OK` records API acceptance, not proof that a card credit has appeared. Store the refund ID and amount with your return-of-goods record. If needed for your merchant integration, pass `additionalParams: ['nds' => '0.00']`; this is the only supported additional refund parameter.
+`returnMoneyToCard=false` has a specific bank meaning: **the store has already returned cash to the customer**. It is not an automatic fallback when a card return is unavailable. Use it only after the corresponding refund procedure has been completed and recorded.
 
-The package has no refund-status method. For an uncertain operation, inspect `orderData()->reverseList`, reports and the bank's operational information. A reverse entry contains an amount and timestamp, not the merchant refund ID; matching by amount alone cannot prove which of two equal refunds succeeded. Preserve the same refund ID if the bank's reconciliation procedure calls for replay. Never turn an unresolved refund into a new operation with a new ID.
+To supply VAT for the return, pass `additionalParams: ['nds' => '0.00']`. `nds` is the only supported additional refund field. `sum` also accepts `Money::fromCents(...)` if your existing refund amount is stored in kopiykas.
 
-## 7. Retrieve guarantee letters
+`ReturnStatus::OK` records API acceptance, not proof that a credit has appeared on the card. `ERROR` and unrecognized return statuses require checking the result; unknown strings remain in `rawStatus`.
 
-Use guarantee documents when your merchant workflow requires the bank's contract or accounting data for an existing application. Fetch them after the application has reached the state permitted by your agreement. A missing or temporarily unavailable document does not by itself prove that the payment failed.
+After a timeout or ambiguous result, do not create a new return ID and send another refund automatically. The package has no refund-status lookup. Use recorded reversals from `orderData()`, reports and the bank's recovery procedure. Reversals contain amount and timestamp, not the merchant refund ID; two equal amounts cannot be distinguished by amount alone.
 
-Retrieve structured document data:
+## 8. Read order details and daily reports
 
-```php
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+### Read invoice data and recorded returns
 
-$mono = app(MonoPartsClient::class);
-$data = $mono->guaranteeLetterDataV2($payment->bank_order_id, [
-    'date' => '2026-10-03',
-    'number' => 'INV-1001',
-]);
-
-$bankDocumentHeader = $data->header;
-$bankDocumentExpansion = $data->expansion;
-$fullDocumentData = $data->raw;
-```
-
-The invoice override is optional. Use your actual issued invoice, not values sent by the browser. For integrations requiring the original data endpoint, call `guaranteeLetterData()` with the same arguments. The DTO retains the bank's nested schema as arrays; those numeric fields are not automatically converted into `Money`.
-
-Download the PDF as original bytes:
+Use `orderData()` for the order's details. It complements `orderState()` rather than replacing the workflow-state query:
 
 ```php
-$pdf = $mono->guaranteeLetter($payment->bank_order_id);
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-return response($pdf, 200, [
-    'Content-Type' => 'application/pdf',
-    'Content-Disposition' => 'attachment; filename="guarantee-letter.pdf"',
-    'Cache-Control' => 'private, no-store',
-]);
-```
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$details = MonoParts::orderData($bankOrderId);
 
-Put this code in an authenticated controller action and authorize access to the commercial order before fetching the document. For archival, write the bytes to a private Laravel storage disk and save its path against the payment. Do not JSON-encode the PDF, put it in logs or publish it on a public disk. The package rejects a successful response that does not begin with a PDF marker.
-
-## 8. Reconcile orders and settlements
-
-Callbacks are the normal notification path. Reconciliation handles lost notifications, dispatch failures, unknown bank IDs, process crashes and local state that remains pending too long. Use scheduled background jobs with bounded batches and backoff; do not poll the bank in a tight browser loop.
-
-### Recover inbox messages
-
-In a scheduled application command, redispatch unprocessed notifications:
-
-```php
-use App\Jobs\ProcessMonopartsNotification;
-use App\Models\MonopartsNotification;
-
-MonopartsNotification::whereNull('processed_at')->orderBy('id')
-    ->chunkById(100, function ($notifications): void {
-        foreach ($notifications as $notification) {
-            ProcessMonopartsNotification::dispatch($notification->id)->onQueue('payments');
-        }
-    });
-```
-
-For a busy installation, add a dispatch lease or pending-job marker to avoid repeatedly enqueuing the same unresolved inbox record. The job's lock and processed check protect processing, but do not replace queue admission control. Monitor old unprocessed notifications and failed jobs instead of redispatching them indefinitely.
-
-### Refresh a known payment
-
-For a selected local payment whose bank ID is known:
-
-```php
-use App\Services\ApplyInstallmentState;
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
-
-$current = app(MonoPartsClient::class)->orderState($payment->bank_order_id);
-app(ApplyInstallmentState::class)->apply($current);
-```
-
-Use `orderState()` for workflow state. Use `orderData()` when you need invoice information, merchant order reference, amount or recorded reversals:
-
-```php
-$details = app(MonoPartsClient::class)->orderData($payment->bank_order_id);
+$merchantOrderId = $details->storeOrderId;
+$invoiceNumber = $details->invoiceNumber;
 $total = $details->totalSum?->toDecimal();
 
 foreach ($details->reverseList as $reverse) {
     $returnedAmount = $reverse->sum?->toDecimal();
-    $returnedAt = $reverse->timestamp;
+    $returnedAt = $reverse->timestamp?->format(DATE_ATOM);
 }
 ```
 
-An absent or unparseable response amount maps to `null`; it does not mean zero. Do not replace it with `0` in financial reconciliation. If the local bank ID is missing after a create timeout, first recover it using the saved create request as described in step 3; order-state methods take a bank UUID, not your commercial order number.
+Response amounts are `Money|null`. Missing or unparseable amounts mean unknown, not zero. Date/time properties are `DateTimeImmutable|null`. The [DTO reference](docs/reference.md#order-details) lists all fields, including invoice, merchant source, IBAN and masked card data.
 
-### Reconcile daily transfers
+### Read a daily report
 
-Use `storeReport()` for financial reconciliation, independently of fulfillment state:
+Use `storeReport()` to reconcile financial operations for a bank reporting date in `Y-m-d` format:
 
 ```php
-$report = app(MonoPartsClient::class)->storeReport('2026-10-02');
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$report = MonoParts::storeReport('2026-10-02');
 
 foreach ($report->orders as $entry) {
     $bankOrderId = $entry->orderId;
@@ -764,74 +385,123 @@ foreach ($report->orders as $entry) {
 }
 ```
 
-The date is a bank reporting date in `Y-m-d` format. Decide the reporting cutoff and timezone with your bank/accounting workflow. Preserve individual operations rather than overwriting one amount on the payment record. An order can have more than one operation.
+`DailyReport::orders` is a list of `DailyReportOrder` objects. An order can have multiple financial operations; do not collapse every row with the same order ID into one settlement. Transaction IDs and other fields may be absent. Choose the reporting cutoff and import identity with your bank/accounting integration. The [report field reference](docs/reference.md#daily-report-rows) covers all returned fields.
 
-Match rows to the stored bank ID, retain transaction IDs when present and record unmatched rows for investigation. Use a bank transaction identifier or a documented composite key when importing the report twice. Do not assume every nullable `transactionId` is populated or use `orderId` alone as a unique settlement key.
+## 9. Get guarantee letters
 
-Schedule your application's inbox/state/report commands in `routes/console.php`, use `withoutOverlapping()` for long tasks and `onOneServer()` with a shared lock-capable cache when running multiple schedulers. Run Laravel's scheduler from cron or `schedule:work`. The package does not install reconciliation commands. See [Laravel scheduling](https://laravel.com/docs/12.x/scheduling).
+Use guarantee-letter methods when your merchant workflow needs the bank's document or accounting data for an existing application. Document availability depends on the bank state and merchant agreement.
 
-## 9. Use QR carts
-
-A QR cart is a separate checkout entry point for a store QR code. Create it when your merchant QR flow has a priced basket ready for the customer. Confirm with the bank which callback contract and order linkage your QR integration receives; do not infer that the returned cart ID is an installment `order_id`.
-
-Persist the store QR ID, a UUID merchant order ID and the priced payload before submission, using the same snapshot principle as the order recipe:
+### Structured data
 
 ```php
-use Illuminate\Support\Str;
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$data = MonoParts::guaranteeLetterDataV2($bankOrderId);
+
+$header = $data->header;
+$expansion = $data->expansion;
+$raw = $data->raw;
+```
+
+These properties preserve the bank's nested arrays. Their monetary fields are not automatically converted to `Money`. For an integration requiring the original data endpoint, use `MonoParts::guaranteeLetterData($bankOrderId)` with the same arguments.
+
+Both data methods and the PDF method accept an optional invoice override:
+
+```php
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$data = MonoParts::guaranteeLetterData($bankOrderId, [
+    'date' => '2026-10-03',
+    'number' => 'INV-1001',
+]);
+```
+
+Supply your actual issued invoice details. Omit the second argument when no override is required.
+
+### PDF bytes
+
+In an existing authorized download action:
+
+```php
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$bankOrderId = '123e4567-e89b-12d3-a456-426614174000';
+$pdf = MonoParts::guaranteeLetter($bankOrderId);
+
+return response($pdf, 200, [
+    'Content-Type' => 'application/pdf',
+    'Content-Disposition' => 'attachment; filename="guarantee-letter.pdf"',
+    'Cache-Control' => 'private, no-store',
+]);
+```
+
+The return value is the original PDF string, not a DTO or base64 value. Authorize the customer's access to the order before downloading. If archiving, use your existing private storage. The package rejects a successful response that does not begin with a PDF marker.
+
+## 10. Create and cancel QR carts
+
+QR carts are a separate bank checkout flow. Use these methods if your merchant setup provides a store QR identifier. Cart creation does not itself establish a completed installment payment.
+
+```php
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
 $qrId = 'your-store-qr-id';
-$qrStoreOrderId = (string) Str::uuid();
-$qrPayload = [
+$cart = MonoParts::createQrCart([
     'qr_id' => $qrId,
-    'store_order_id' => $qrStoreOrderId,
+    'store_order_id' => '123e4567-e89b-12d3-a456-426614174001',
     'products' => [
         ['name' => 'Display', 'count' => 1, 'sum' => '1234.56'],
     ],
     'result_callback' => 'https://checkout.example.com/qr-callback',
-];
+]);
 
-$mono = app(MonoPartsClient::class);
-$cart = $mono->createQrCart($qrPayload);
 $bankCartId = $cart->id;
 ```
 
-The example assumes you have saved `$qrId`, `$qrStoreOrderId` and `$qrPayload` in your application's QR checkout record before the bank call; save `$bankCartId` when the response arrives. A successful create means the cart was created, not that the customer completed payment.
+Unlike the ordinary create request, QR `store_order_id` must be a UUID, and `result_callback` is required. Retain the merchant ID, QR ID and returned cart ID with your existing checkout information. Do not substitute the cart ID for a bank order ID in order-state methods.
 
-The bundled `/monoparts/callback` validates the order-state schema. Use it for QR only if the bank confirms that the callback has that same contract. For a different QR callback schema, register an application route, verify its original body signature using `SignerInterface`, validate the agreed fields, persist it in an inbox and acknowledge only after persistence. The package does not provide a generic QR callback parser.
+Confirm the QR callback schema with the bank. The bundled callback endpoint validates the order-state contract; it handles a QR result only if that result follows the same contract. A different QR schema needs your existing application endpoint to verify the original body using the package's `SignerInterface` and validate the agreed fields. There is no generic QR callback parser in this package.
 
-When abandoning the basket, cancel by the store QR ID:
-
-```php
-$mono->cancelQrCart($qrId);
-```
-
-Cancellation returns `void` after a successful HTTP response and accepts `qr_id`, not `$bankCartId`. Serialize local operations on one QR so an old cancellation cannot cancel a newer basket using the same store QR. The package has no QR-cart lookup method and does not normalize create-QR HTTP 409 as an order duplicate. After an uncertain QR write, use the bank's QR recovery procedure instead of blindly retrying or inventing a status lookup.
-
-## 10. Check client and broker eligibility
-
-Client lookup can run before order creation to adjust the checkout experience:
+Cancel an abandoned basket by the **store QR ID**, not the returned cart ID:
 
 ```php
-use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
-$mono = app(MonoPartsClient::class);
-$client = $mono->validateClientV2('+380500000001');
-$isBankClient = $client->found;
+MonoParts::cancelQrCart('your-store-qr-id');
 ```
 
-`found` means the lookup found a client. It does not approve the purchase, reserve credit or guarantee that `createOrder()` will succeed. A negative lookup is a business result, not an HTTP exception. The method accepts an omitted phone because the bank schema permits it; for a customer-specific check, supply the actual validated phone.
+Cancellation returns `void` after a successful HTTP response. Coordinate operations on a reused store QR so an old cancellation does not cancel a new basket. The package has no cart-state lookup or duplicate-QR normalization; use the bank's QR recovery procedure after an uncertain write.
 
-Broker availability is a different endpoint. Use it only if your broker agreement provides a broker ID and employee/outlet identifiers. Configure the broker ID on the server:
+## 11. Check clients and broker availability
+
+### Look up a client
+
+Run a client lookup before creation when your checkout needs to know whether the phone belongs to a bank client:
+
+```php
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$client = MonoParts::validateClientV2('+380500000001');
+$found = $client->found;
+```
+
+`found=false` is a normal lookup result. `true` does not approve a purchase or reserve credit. The phone argument is optional in the bank schema, but supply it for a customer-specific lookup.
+
+### Check broker availability
+
+This operation requires a broker integration and its employee/outlet identifiers. Set the broker ID issued to you:
 
 ```dotenv
 MONOPARTS_BROKER_ID=your-broker-id
 ```
 
-Then check the priced basket:
+Then query availability for the basket:
 
 ```php
-$availability = $mono->brokerAvailability(
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+$result = MonoParts::brokerAvailability(
     amount: '1234.56',
     employeeId: 'employee-1',
     inn: '1234567890',
@@ -839,128 +509,162 @@ $availability = $mono->brokerAvailability(
     phone: '+380500000001',
 );
 
-$installmentsAreAvailable = $availability->available;
+$available = $result->available;
 ```
 
-The call uses `broker-id` instead of `store-id`. A final optional `brokerId` argument overrides the configured broker ID; select overrides from trusted server-side configuration. `available=false` is a normal eligibility result. `true` still does not replace creation, customer approval or store confirmation. Keep tax identifiers and phones out of request URLs and routine logs.
+`inn` is the customer's tax identifier. Use identifiers from your actual broker setup. The method uses the `broker-id` header instead of `store-id`. An optional `brokerId` argument overrides the configured broker ID for this call; choose it from trusted server configuration.
 
-## 11. Handle errors and uncertain operations
+`available=false` is a business result, not an HTTP failure. `true` still does not replace order creation and customer approval. Keep tax IDs and phones out of routine logs.
 
-Classify failures by whether the bank may have acted. Retain the merchant operation ID, request snapshot and local operation record before making a write.
+## 12. Handle errors and inspect events
 
-| Result | What it establishes | Application response |
-| --- | --- | --- |
-| `ConfigurationException` or local `PayloadValidationException` | The client could not send a valid request | Fix settings or input; show field errors where appropriate |
-| `ApiResponseException` | The bank returned a non-success HTTP response | Inspect `statusCode` and the bank message; distinguish an explicit rejection from a server failure |
-| `TransportException` | Network failed or the response could not be interpreted | For writes, retain an uncertain operation and reconcile before replay |
-| `SignatureValidationException` | A required response signature could not be trusted | Do not accept the result; a write may still have happened |
-| Known negative DTO result | The API succeeded but the business answer was negative | Handle the declined/negative result without treating it as a network failure |
-| Application exception after transport | A listener or local persistence failed | Reconcile: the remote operation may already be complete |
-
-The HTTP client does not automatically retry. A job's retry mechanism is an application policy, not a guarantee that every bank operation can be repeated. State reads can use bounded retry/backoff; writes require operation-specific reconciliation. HTTP 500 after a write and a malformed successful response are both potentially ambiguous.
-
-For example, catch field-validation errors at your checkout boundary:
+Local payload errors throw `PayloadValidationException` before the HTTP request. At your existing checkout boundary, inspect the field errors:
 
 ```php
 use Inkvizitoria\MonoParts\Exceptions\PayloadValidationException;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
 
 try {
-    $payment = app(\App\Services\SubmitInstallmentPayment::class)->submit($payment->id);
-} catch (PayloadValidationException $e) {
-    return response()->json(['errors' => $e->errors()], 422);
+    $created = MonoParts::createOrder($payload);
+} catch (PayloadValidationException $exception) {
+    $fieldErrors = $exception->errors();
+    // Translate these field errors through your existing validation handling.
+    throw $exception;
 }
 ```
 
-Other failures should produce your application's pending/review or operational-error response; do not expose raw bank messages, stack traces or customer details to a public endpoint. Return a local payment reference so the customer can resume the same checkout.
+This example uses the payload from [order creation](#4-create-an-order). The package exception is not Laravel's `ValidationException`; adapt it to your existing HTTP or console error handling.
 
-The default log channel is `monoparts`, writing endpoint, HTTP status and normalized result to `storage/logs/monoparts.log`. Observe `ResponseReceived` when you need status metadata, and `CallbackFailed` for rejected callbacks. Keep observability listeners reliable: a thrown listener can turn a successful bank call into an application exception. The package has no general failed-outbound-request event; observe those failures at your service boundary.
+| Failure | Available information | How to interpret it |
+| --- | --- | --- |
+| `ConfigurationException` | Exception message | Settings or required credentials are invalid |
+| `PayloadValidationException` | `errors()` by field | Local request or signed callback validation failed |
+| `ApiResponseException` | `statusCode`, `exceptionResponse->message` | Bank returned a non-success HTTP response |
+| `TransportException` | Exception message and previous exception where available | Network failed, or response shape/content was invalid |
+| `SignatureValidationException` | Exception message | A required signature could not be trusted |
 
-For application logs, record your local payment/refund ID, endpoint, attempt count and exception type. Customer phones, tax IDs, request snapshots, documents and signatures require controlled storage and retention. The inbox fingerprint supports duplicate processing; it is not a bank transaction ID or a substitute for signature verification.
+All are in `Inkvizitoria\MonoParts\Exceptions` and extend `MonoPartsException`. An HTTP 500, timeout, invalid response or listener exception after sending a write may leave the remote operation completed. Reconcile before replaying. The client performs no automatic retries. Read requests can use bounded retry/backoff in your existing flow; write recovery depends on the operation.
 
-## 12. Test and deploy the integration
+Successful HTTP responses can carry negative business results: `found=false`, `available=false`, `ReturnStatus::ERROR` or `OrderState::FAIL`. Check the DTO rather than equating HTTP success with an approved purchase.
 
-### Verify the application workflow offline
+### Inspect response metadata
 
-Use Laravel `Http::fake()` and `Http::preventStrayRequests()` to test your own persistence and state transitions. Keep queue processing under test control: use `Queue::fake()` to assert that inbox capture dispatches a job, then execute the job separately with fake bank responses. Do not use `Event::fake()` when testing the real `CallbackValidated` listener, since it prevents that listener from running.
-
-A callback test should send the exact signed bytes:
+Public methods return their DTOs directly. To observe the HTTP status and normalized result, register `ResponseReceived` in your existing service provider:
 
 ```php
+use Illuminate\Support\Facades\Event;
+use Inkvizitoria\MonoParts\Events\ResponseReceived;
+
+Event::listen(ResponseReceived::class, function (ResponseReceived $event): void {
+    $httpStatus = $event->response->httpStatus;
+    $status = $event->response->status;
+    $data = $event->response->data;
+
+    // Feed metadata to your existing monitoring without logging customer payloads.
+});
+```
+
+`ResponseStatus` distinguishes creation, duplicate creation, state and other operation results. `successful()` describes the normalized result; `ORDER_IN_PROCESS` counts as successful processing but does not mean settlement. Unknown high-level states produce `ORDER_UNKNOWN`, which is not successful.
+
+Other events are `RequestSending`, `CallbackReceived`, `CallbackValidated` and `CallbackFailed`. Only `CallbackValidated` establishes a valid callback. Event payloads and contracts are in the [event reference](docs/reference.md#events-and-response-metadata).
+
+The default `monoparts` log records request endpoints and response statuses in `storage/logs/monoparts.log`. It does not log outgoing bodies, signing secrets or PDF bytes. Your listeners receive customer data; choose what they record. Configure the channel in `config/monoparts.php` if needed.
+
+## 13. Test the integration
+
+Use Laravel's `Http::fake()` to exercise package calls without contacting the bank. In an existing Laravel feature test:
+
+```php
+use Illuminate\Support\Facades\Http;
+use Inkvizitoria\MonoParts\Facades\MonoParts;
+
+config([
+    'monoparts.environment' => 'sandbox',
+    'monoparts.merchant.store_id' => 'test-store',
+    'monoparts.merchant.signature_secret' => 'test-secret',
+]);
+
+Http::preventStrayRequests();
+Http::fake([
+    'https://u2-demo-ext.mono.st4g3.com/api/order/create' => Http::response([
+        'order_id' => '123e4567-e89b-12d3-a456-426614174000',
+    ], 201),
+]);
+
+// Use the payload from the create-order recipe.
+$created = MonoParts::createOrder($payload);
+$this->assertSame('123e4567-e89b-12d3-a456-426614174000', $created->orderId);
+Http::assertSentCount(1);
+Http::assertSent(fn ($request) => $request->hasHeader('store-id', 'test-store')
+    && $request->hasHeader('signature')
+    && $request['store_order_id'] === $payload['store_order_id']);
+```
+
+Set test configuration before resolving the client. Verify your existing order handling with positive, negative and duplicate responses, and with failures after a write. Faking HTTP does not exercise the bank or public network.
+
+### Send a signed callback in a feature test
+
+The signature must match the exact bytes passed to the endpoint:
+
+```php
+use Illuminate\Support\Facades\Event;
+use Inkvizitoria\MonoParts\Events\CallbackValidated;
 use Inkvizitoria\MonoParts\Security\Signer;
 
+config(['monoparts.merchant.signature_secret' => 'test-secret']);
+Event::fake([CallbackValidated::class]);
+
 $body = json_encode([
-    'order_id' => $payment->bank_order_id,
+    'order_id' => '123e4567-e89b-12d3-a456-426614174000',
     'state' => 'SUCCESS',
     'order_sub_state' => 'SUCCESS',
 ], JSON_THROW_ON_ERROR);
 $signature = (new Signer('test-secret'))->sign($body);
 
-$response = $this->call('POST', '/monoparts/callback', [], [], [], [
+$this->call('POST', '/monoparts/callback', [], [], [], [
     'CONTENT_TYPE' => 'application/json',
     'HTTP_SIGNATURE' => $signature,
-], $body);
+], $body)->assertOk();
 
-$response->assertOk();
+Event::assertDispatched(CallbackValidated::class, fn ($event) =>
+    $event->stateInfo?->orderId === '123e4567-e89b-12d3-a456-426614174000');
 ```
 
-Place this snippet in a Laravel feature test after configuring `monoparts.merchant.signature_secret` to `test-secret`, inserting a local payment with the bank UUID, and faking queue dispatch. Check the inbox row and job dispatch as well as the HTTP status.
+`Event::fake()` above verifies package dispatch; it prevents the selected event's application listeners from running. Test your listener separately without faking that event. Also cover invalid signatures, duplicate callbacks and callback/create-response timing.
 
-Cover the whole lifecycle: repeated checkout, duplicate create response, create timeout recovery, callback before the bank ID is saved, duplicate/out-of-order callbacks, invalid signature, failed dispatch, pending and terminal states, confirmation timeout after issuance, competing refund reservations, uncertain refunds and repeated report imports. Verify that negative or unknown states never trigger fulfillment automatically.
+### Package development and sandbox tests
 
-The package repository has its own offline suite:
+The package repository's own test suite, compatibility matrix and opt-in sandbox tests are documented in the [testing reference](docs/reference.md#testing). Those commands run from a source checkout; installed distribution archives exclude the package tests.
 
-```bash
-composer install
-composer validate --strict
-composer test
-composer audit
-```
+Use the bank's sandbox identities and merchant scenarios for end-to-end acceptance. Verify that the bank can reach your callback URL and that your existing order handling receives the event. Sandbox writes can leave applications in the sandbox; do not run them against production credentials.
 
-These are package-development commands; the installed library's distribution excludes its tests. Your Laravel application's tests must also exercise its models, locks, jobs and operational recovery.
+## 14. Use production credentials
 
-### Exercise the bank sandbox deliberately
-
-For the package's optional integration suite, export credentials in your shell:
-
-```bash
-export MONOPARTS_RUN_INTEGRATION=1
-export MONOPARTS_TEST_STORE_ID='your-sandbox-store-id'
-export MONOPARTS_TEST_SIGNATURE_SECRET='your-sandbox-signing-secret'
-export MONOPARTS_TEST_PHONE='your-sandbox-test-phone'
-composer test:integration
-```
-
-The suite uses the fixed sandbox host. It skips without explicit opt-in and credentials. To also create a sandbox order and query its state, set `MONOPARTS_TEST_CREATE_ORDER=1`; that order remains in the sandbox. These tests do not load a local `.env` file automatically or prove that your public callback endpoint, worker or accounting integration is working.
-
-For application acceptance testing, exercise the merchant flow enabled on your bank account and check the externally reachable callback URL, stored bank mapping, inbox, queue worker and fulfillment decision. Use the bank's documented sandbox identities and scenarios.
-
-### Deploy the configured application
-
-Switch to production credentials only after the sandbox workflow passes:
+Once the sandbox flow works, configure the credentials issued for production:
 
 ```dotenv
 MONOPARTS_ENV=production
 MONOPARTS_STORE_ID=your-production-store-id
 MONOPARTS_SIGNATURE_SECRET=your-production-signing-secret
+MONOPARTS_TIMEOUT=30
+MONOPARTS_CONNECT_TIMEOUT=10
 ```
 
-Rebuild application caches and restart long-running workers:
+Rebuild Laravel configuration and route caches according to your deployment process:
 
 ```bash
 php artisan config:cache
 php artisan route:cache
-php artisan event:cache
-php artisan queue:restart
 ```
 
-Check the public callback address generated by `route('monoparts.callback')`, including proxy/HTTPS configuration. If you change the route or hostname, consider outstanding attempts: their saved payloads contain the previous callback address. Keep that endpoint reachable while they complete or reconcile the change with the bank.
+Restart long-running workers if your existing integration uses them. Verify the callback address after deployment. Outstanding orders retain the callback URL sent at creation; a hostname/path change must account for those orders.
 
-Enable response-signature enforcement with `MONOPARTS_VERIFY_RESPONSE_SIGNATURE=true` when your bank integration supplies signed HTTP responses. This setting makes missing response signatures fail; it does not disable or enable callback verification, which is always required. Check your merchant integration before changing it in production.
+Requests are always signed, and callbacks are always signature-verified. Set `MONOPARTS_VERIFY_RESPONSE_SIGNATURE=true` to additionally require signatures on bank HTTP responses **when your bank integration provides them**. Missing signatures then fail, including on error responses. This flag does not control callback verification.
 
-Monitor pending attempts, old inbox records, failed jobs, unresolved confirmations/refunds, unmatched report rows and callback 4xx/5xx responses. Configure recovery jobs and escalation ownership before accepting real purchases. The package's default timeout, signature and logging behavior are listed in the [reference](docs/reference.md).
+The default signer uses HMAC-SHA256 with the shared secret. A custom implementation can be bound through `SignerInterface`; see [signing](docs/reference.md#signing). Keep credentials server-side and use the environment matching those credentials.
 
-## Sources, license and maintenance
+## Sources and maintenance
 
-Bank operations follow the [monobank API documentation](https://u2-demo-ext.mono.st4g3.com/docs/index.html) and [Swagger schema](https://u2-demo-ext.mono.st4g3.com/v2/api-docs). The application persistence, inbox, locking and reconciliation recipes are integration patterns supplied by this cookbook; they are not bank promises about delivery order, retry intervals or exactly-once execution.
+Bank contracts: [API documentation](https://u2-demo-ext.mono.st4g3.com/docs/index.html) and [Swagger schema](https://u2-demo-ext.mono.st4g3.com/v2/api-docs). This cookbook describes the package's interfaces and integration considerations; it does not prescribe an application database or fulfillment architecture.
 
 MIT. See [LICENSE](LICENSE). Maintained by [Denis Drozh](https://github.com/Inkvizitoria). Report reproducible package issues at [GitHub Issues](https://github.com/Inkvizitoria/laravel-monoparts/issues).

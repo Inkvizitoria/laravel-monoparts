@@ -1,6 +1,6 @@
 # API and configuration reference
 
-Use the [cookbook](../README.md) for the complete application workflow. This page documents package contracts and limits. Application models and jobs shown in the cookbook are not installed by the package.
+Use the [cookbook](../README.md) for operation examples and the payment flow. This page documents package contracts, DTOs, configuration and validation limits.
 
 ## Contents
 
