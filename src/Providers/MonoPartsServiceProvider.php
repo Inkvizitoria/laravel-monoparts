@@ -10,6 +10,7 @@ use Inkvizitoria\MonoParts\Contracts\SignerInterface;
 use Inkvizitoria\MonoParts\Http\Callbacks\CallbackProcessor;
 use Inkvizitoria\MonoParts\Http\Controllers\CallbackController;
 use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Security\JsonBodyBuilder;
 use Inkvizitoria\MonoParts\Support\MonoPartsLogger;
 use Inkvizitoria\MonoParts\Support\SignatureFactory;
 use Illuminate\Contracts\Container\Container;
@@ -34,15 +35,17 @@ final class MonoPartsServiceProvider extends ServiceProvider
 
         $this->app->singleton(SignatureFactory::class);
 
-        $this->app->singleton(SignerInterface::class, function (Container $app): SignerInterface {
-            /** @var array<string, mixed> $config */
-            $config = $app['config']->get('monoparts', []);
+        if (!$this->app->bound(SignerInterface::class)) {
+            $this->app->singleton(SignerInterface::class, function (Container $app): SignerInterface {
+                /** @var array<string, mixed> $config */
+                $config = $app['config']->get('monoparts', []);
 
-            return $app->make(SignatureFactory::class)->make(
-                $app->make(MonoPartsConfig::class),
-                $config['signature'] ?? []
-            );
-        });
+                return $app->make(SignatureFactory::class)->make(
+                    $app->make(MonoPartsConfig::class),
+                    $config['signature'] ?? []
+                );
+            });
+        }
 
         $this->app->singleton(MonoPartsLogger::class, static function (Container $app): MonoPartsLogger {
             /** @var array<string, mixed> $config */
@@ -50,6 +53,8 @@ final class MonoPartsServiceProvider extends ServiceProvider
 
             return new MonoPartsLogger($app->make('log'), $config);
         });
+
+        $this->app->singleton(JsonBodyBuilder::class);
 
         $this->app->singleton(MonoPartsClient::class, static function (Container $app): MonoPartsClient {
             $httpClient = $app->bound('http') ? $app->make('http') : (Http::getFacadeRoot() ?? new Factory());
@@ -60,6 +65,7 @@ final class MonoPartsServiceProvider extends ServiceProvider
                 signer: $app->make(SignerInterface::class),
                 events: $app->make('events'),
                 logger: $app->make(MonoPartsLogger::class),
+                bodyBuilder: $app->make(JsonBodyBuilder::class),
             );
         });
 
@@ -79,7 +85,7 @@ final class MonoPartsServiceProvider extends ServiceProvider
     {
         $this->publishes([
             __DIR__ . '/../../config/monoparts.php' => config_path('monoparts.php'),
-        ], 'config');
+        ], ['monoparts-config', 'config']);
 
         $this->registerRoutes();
     }

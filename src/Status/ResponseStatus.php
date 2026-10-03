@@ -10,6 +10,7 @@ namespace Inkvizitoria\MonoParts\Status;
  */
 enum ResponseStatus: string
 {
+    case ORDER_UNKNOWN = 'order_unknown';
     case ORDER_SUCCESS = 'order_success';
     case ORDER_FAIL = 'order_fail';
     case ORDER_IN_PROCESS = 'order_in_process';

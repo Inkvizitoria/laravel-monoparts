@@ -7,16 +7,17 @@ namespace Inkvizitoria\MonoParts\Contracts;
 interface SignerInterface
 {
     /**
-     * Create signature for a request/response payload.
-     *
-     * @param array<string, mixed> $payload
+     * Create signature for a raw body string.
      */
-    public function sign(array $payload): string;
+    public function sign(string $body): string;
 
     /**
-     * Verify payload signature.
-     *
-     * @param array<string, mixed> $payload
+     * Verify signature for a raw body string.
      */
-    public function verify(array $payload, string $signature): bool;
+    public function verify(string $body, string $signature): bool;
+
+    /**
+     * Assert that signature is valid for a raw body string.
+     */
+    public function assertValid(string $body, string $signature): void;
 }

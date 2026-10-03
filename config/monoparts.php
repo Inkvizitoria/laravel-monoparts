@@ -52,6 +52,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Signature verification for responses
+    |--------------------------------------------------------------------------
+    */
+    'http' => [
+        'timeout' => env('MONOPARTS_TIMEOUT', 30),
+        'connect_timeout' => env('MONOPARTS_CONNECT_TIMEOUT', 10),
+    ],
+
+    'verify_response_signature' => (bool) env('MONOPARTS_VERIFY_RESPONSE_SIGNATURE', false),
+
+    /*
+    |--------------------------------------------------------------------------
     | HTTP headers
     |--------------------------------------------------------------------------
     */
@@ -69,7 +81,6 @@ return [
         'enabled' => true,
         'path' => env('MONOPARTS_CALLBACK_PATH', '/monoparts/callback'),
         'middleware' => ['api'],
-        'event' => \Inkvizitoria\MonoParts\Events\CallbackReceived::class,
     ],
 
     /*

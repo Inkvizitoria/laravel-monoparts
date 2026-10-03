@@ -36,13 +36,16 @@ final class CallbackProcessor implements CallbackHandlerInterface
      */
     public function handle(Request $request): Response
     {
-        $payload = $request->all();
+        $rawBody = (string) $request->getContent();
         $signature = $request->header($this->config->signatureHeader);
-
-        $this->events->dispatch(new CallbackReceived($payload, $signature));
+        $payload = [];
+        $received = false;
 
         try {
-            $this->assertSignature($payload, $signature);
+            $this->assertSignature($rawBody, $signature);
+            $payload = $this->decodePayload($rawBody);
+            $received = true;
+            $this->events->dispatch(new CallbackReceived($payload, $signature));
             $validated = $this->validatePayload($payload);
             $stateInfo = OrderStateInfo::fromPayload($validated);
 
@@ -50,16 +53,28 @@ final class CallbackProcessor implements CallbackHandlerInterface
 
             return new JsonResponse(['message' => 'ok'], Response::HTTP_OK);
         } catch (SignatureValidationException $e) {
+            if (!$received) {
+                $received = true;
+                $this->events->dispatch(new CallbackReceived($payload, $signature));
+            }
             $this->events->dispatch(new CallbackFailed($payload, $signature, $e));
             $this->logger->get()->warning('monoparts.callback.rejected', ['reason' => $e->getMessage()]);
 
             return new JsonResponse(['message' => $e->getMessage()], Response::HTTP_FORBIDDEN);
         } catch (PayloadValidationException $e) {
+            if (!$received) {
+                $received = true;
+                $this->events->dispatch(new CallbackReceived($payload, $signature));
+            }
             $this->events->dispatch(new CallbackFailed($payload, $signature, $e));
             $this->logger->get()->warning('monoparts.callback.invalid_payload', ['reason' => $e->getMessage()]);
 
             return new JsonResponse(['message' => $e->getMessage(), 'errors' => $e->errors()], Response::HTTP_BAD_REQUEST);
         } catch (Throwable $e) {
+            if (!$received) {
+                $received = true;
+                $this->events->dispatch(new CallbackReceived($payload, $signature));
+            }
             $this->events->dispatch(new CallbackFailed($payload, $signature, $e));
             $this->logger->get()->error('monoparts.callback.failed', [
                 'exception' => $e,
@@ -72,11 +87,35 @@ final class CallbackProcessor implements CallbackHandlerInterface
     /**
      * @param array<string, mixed> $payload
      */
-    private function assertSignature(array $payload, ?string $signature): void
+    private function assertSignature(string $rawBody, ?string $signature): void
     {
-        if (!$signature || !$this->signer->verify($payload, $signature)) {
+        if (!$signature) {
             throw new SignatureValidationException('Invalid callback signature.');
         }
+
+        $this->signer->assertValid($rawBody, $signature);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function decodePayload(string $rawBody): array
+    {
+        if ($rawBody === '') {
+            throw new PayloadValidationException(['body' => ['Empty JSON body.']], 'Empty JSON body.');
+        }
+
+        try {
+            $payload = json_decode($rawBody, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new PayloadValidationException(['body' => [$e->getMessage()]], 'Invalid JSON payload.');
+        }
+
+        if (!is_array($payload)) {
+            throw new PayloadValidationException(['body' => ['Invalid JSON payload.']], 'Invalid JSON payload.');
+        }
+
+        return $payload;
     }
 
     /**
@@ -88,7 +127,7 @@ final class CallbackProcessor implements CallbackHandlerInterface
         $validator = Validator::make($payload, [
             'order_id' => ['required', 'string', 'min:1', 'max:100', 'regex:/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/'],
             'state' => ['required', 'string', 'in:SUCCESS,FAIL,IN_PROCESS'],
-            'order_sub_state' => ['nullable', 'string', 'regex:/^[A-Z_]+$/'],
+            'order_sub_state' => ['nullable', 'string'],
             'message' => ['nullable', 'string'],
         ]);
 

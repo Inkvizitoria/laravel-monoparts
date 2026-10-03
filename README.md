@@ -1,467 +1,371 @@
 # Laravel MonoParts
 
-Пакет для інтеграції Monobank «Покупка частинами» у Laravel 8–12 (PHP 8.1+). Дає строгі правила валідації, підпис/верифікацію запитів і колбеків, typed DTO-відповіді, доменні статуси, події та конфігурований логер. Не вимагає БД.
+Laravel client for monobank installment payments (Purchase in Parts). The package handles order creation, confirmation, cancellation, refunds, reports, guarantee letters, QR carts and signed order callbacks. It does not store orders or require a database.
 
-## Зміст
-- [Фічі](#фічі)
-- [Вимоги](#вимоги)
-- [Встановлення](#встановлення)
-- [Конфігурація](#конфігурація)
-- [Підпис запитів і відповідей](#підпис-запитів-і-відповідей)
-- [Швидкий старт](#швидкий-старт)
-- [Методи API](#методи-api)
-- [DTO та статуси](#dto-та-статуси)
-- [Колбеки](#колбеки)
-- [Події](#події)
-- [Винятки](#винятки)
-- [Логи](#логи)
-- [Розширення](#розширення)
-- [Тестування](#тестування)
-- [Автор](#автор)
+The request paths and payloads follow the bank's [API documentation](https://u2-demo-ext.mono.st4g3.com/docs/index.html) and [Swagger schema](https://u2-demo-ext.mono.st4g3.com/v2/api-docs).
 
-## Фічі
-- Повна типізація та строгі payload-правила, що відповідають документації Monobank.
-- Підписування кожного запиту та перевірка колбеків через HMAC SHA256 + Base64.
-- Відповіді нормалізовані в DTO з доменними статусами (enum).
-- Події до/після HTTP-запиту та для колбеків.
-- Окремий канал логування з можливістю перевизначення.
-- Мінімум залежностей, пакет не тягне Laravel як обов’язкову залежність, крім `illuminate/*`.
+## Requirements
 
-## Вимоги
-- PHP 8.1+
-- Laravel 8–12
-- ext-json
+| Laravel | PHP |
+| --- | --- |
+| 12 | 8.2–8.5 |
+| 13 | 8.3–8.5 |
 
-## Встановлення
+Composer installs the required Illuminate components, Laravel's validator and Guzzle. Version 2 does not support Laravel 8–11. See [UPGRADING.md](UPGRADING.md) for changes from v1.
+
+## Installation
+
 ```bash
-composer require inkvizitoria/laravel-monoparts
-php artisan vendor:publish --provider="Inkvizitoria\\MonoParts\\Providers\\MonoPartsServiceProvider" --tag=config
+composer require inkvizitoria/laravel-monoparts:^2.0
+php artisan vendor:publish --tag=monoparts-config
 ```
 
-## Конфігурація
-`config/monoparts.php`:
+Laravel discovers the service provider and facade automatically. Publishing creates `config/monoparts.php`.
 
-- `environment`: `sandbox|stage|production`
-- `production_url`: базовий URL прод середовища
-- `merchant.store_id`, `merchant.signature_secret`, `merchant.broker_id`
-- `signature.header` (за замовчуванням `signature`), `signature.algo`
-- `headers.store`, `headers.broker` для кастомних назв хедерів
-- `callbacks.*` для ввімкнення/шляху/мідляр
-- `logging.*` канал або локальний файл
+Set the credentials supplied by the bank:
 
-`.env` приклад:
-```
+```dotenv
 MONOPARTS_ENV=production
 MONOPARTS_STORE_ID=your-store-id
-MONOPARTS_SIGNATURE_SECRET=your-hmac-secret
-MONOPARTS_BROKER_ID=optional-broker-id
+MONOPARTS_SIGNATURE_SECRET=your-signing-secret
 ```
 
-Середовища та базові URL:
-- sandbox: `https://u2-demo-ext.mono.st4g3.com`
-- stage: `https://u2-ext.mono.st4g3.com`
-- production: `https://u2.monobank.com.ua`
+Use `MONOPARTS_BROKER_ID` when calling the broker availability endpoint. Credentials are resolved when the client or callback handler is first used; the package can be installed before credentials are configured.
 
-## Підпис запитів і відповідей
-Підпис передається в заголовку `signature`. Пакет підписує **JSON body** кожного запиту:
+After changing a cached configuration, rebuild it:
 
-```
-signature = base64_encode(
-    hash_hmac('sha256', json_body, signature_secret, true)
-)
+```bash
+php artisan config:cache
 ```
 
-JSON формується через `json_encode` з UTF-8. Для колбеків модуль перевіряє підпис тим самим алгоритмом.
+## Configuration
 
-## Швидкий старт
+| Config key | Environment variable | Default |
+| --- | --- | --- |
+| `environment` | `MONOPARTS_ENV` | `production` |
+| `production_url` | `MONOPARTS_PROD_URL` | `https://u2.monobank.com.ua` |
+| `merchant.store_id` | `MONOPARTS_STORE_ID` | Empty |
+| `merchant.signature_secret` | `MONOPARTS_SIGNATURE_SECRET` | Empty |
+| `merchant.broker_id` | `MONOPARTS_BROKER_ID` | Empty |
+| `http.timeout` | `MONOPARTS_TIMEOUT` | 30 seconds |
+| `http.connect_timeout` | `MONOPARTS_CONNECT_TIMEOUT` | 10 seconds |
+| `signature.driver` | `MONOPARTS_SIGNATURE_DRIVER` | `hmac` |
+| `signature.algo` | `MONOPARTS_SIGNATURE_ALGO` | `sha256` |
+| `signature.header` | `MONOPARTS_SIGNATURE_HEADER` | `signature` |
+| `verify_response_signature` | `MONOPARTS_VERIFY_RESPONSE_SIGNATURE` | `false` |
+| `headers.store` | `MONOPARTS_STORE_ID_HEADER` | `store-id` |
+| `headers.broker` | `MONOPARTS_BROKER_ID_HEADER` | `broker-id` |
+| `callbacks.path` | `MONOPARTS_CALLBACK_PATH` | `/monoparts/callback` |
+| `logging.channel` | `MONOPARTS_LOG_CHANNEL` | `monoparts` |
+| `logging.fallback_channel` | `MONOPARTS_FALLBACK_CHANNEL` | `stack` |
+| `logging.channel_config.level` | `MONOPARTS_LOG_LEVEL` | `info` |
+
+`environment` accepts `sandbox`, `stage` or `production`. The bundled non-production hosts are:
+
+- Sandbox: `https://u2-demo-ext.mono.st4g3.com`
+- Stage: `https://u2-ext.mono.st4g3.com`
+
+Change non-production URLs in `base_urls`. URLs must use HTTPS and cannot contain credentials, query strings or fragments. Timeouts must be positive integer seconds.
+
+The client sends each request once. It does not automatically retry writes. After a timeout, a request may already have reached the bank. Keep the same `store_order_id` when reconciling or repeating an order creation, and keep the same `store_return_id` for a refund operation.
+
+## Create an order
+
+Use the facade or inject `Inkvizitoria\MonoParts\Http\MonoPartsClient` into your service:
+
 ```php
 use Inkvizitoria\MonoParts\Facades\MonoParts;
 
 $order = MonoParts::createOrder([
-    'store_order_id' => 'ORDER-001',
-    'client_phone' => '+380501234567',
-    'total_sum' => 1234.56,
+    'store_order_id' => 'ORDER-1001',
+    'client_phone' => '+380500000001',
+    'total_sum' => '1234.56',
     'invoice' => [
-        'date' => '2024-05-01',
-        'number' => 'INV-1',
+        'date' => '2026-10-03',
+        'number' => 'INV-1001',
         'source' => 'INTERNET',
     ],
     'available_programs' => [
-        ['available_parts_count' => [3, 6, 10], 'type' => 'payment_installments'],
+        [
+            'available_parts_count' => [3, 6],
+            'type' => 'payment_installments',
+        ],
     ],
     'products' => [
-        ['name' => 'Телевізор', 'count' => 1, 'sum' => 1234.56],
+        ['name' => 'Display', 'count' => 1, 'sum' => '1234.56'],
     ],
-    'result_callback' => 'https://example.com/monoparts/callback',
+    'result_callback' => route('monoparts.callback'),
 ]);
 
-$paid = MonoParts::checkPaid($order->orderId);
-$state = MonoParts::orderState($order->orderId);
+$bankOrderId = $order->orderId;
+$state = MonoParts::orderState($bankOrderId);
 ```
 
-## Методи API
-Усі методи доступні через фасад `MonoParts` або DI через `MonoPartsClient`.
+Persist your local order identifier and the bank's `orderId` in your application. HTTP 201 means the application was accepted for processing, not that payment succeeded. HTTP 409 from order creation returns the existing order ID; its normalized status is `ORDER_DUPLICATE`.
 
-### Check Paid
-- Сигнатура: `MonoParts::checkPaid(string $orderId): CheckPaidResult`
-- Endpoint: `/api/order/check/paid`
-- Payload: `order_id` (UUID-рядок)
-- Returns: `CheckPaidResult { fullyPaid: bool, bankCanReturnMoneyToCard: bool }`
-- ResponseStatus: `CHECK_PAID_YES` або `CHECK_PAID_NO`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
+For stores that require delivery confirmation, call `confirmOrder()` when the goods are issued. `rejectOrder()` cancels an order before delivery. Use `returnOrder()` for a full or partial refund after delivery. The bank determines whether an operation is permitted for the current order state.
+
+### Create payload validation
+
+| Field | Rule |
+| --- | --- |
+| `store_order_id` | Required string, 1–64 characters |
+| `client_phone` | Required `+380` followed by nine digits |
+| `total_sum` | Required amount, at least UAH 1.00 |
+| `invoice.date` | Required date in `Y-m-d` format |
+| `invoice.number` | Required non-empty string |
+| `invoice.source` | `STORE`, `INTERNET` or `CHECKOUT` |
+| `invoice.point_id` | Optional string, 1–50 characters |
+| `available_programs` | Required non-empty list |
+| `available_programs[].type` | `payment_installments` |
+| `available_programs[].available_parts_count` | Non-empty list of positive 32-bit integers |
+| `products` | Required non-empty list |
+| `products[].name` | String, 1–500 characters |
+| `products[].count` | Positive 32-bit integer |
+| `products[].sum` | Unit price, at least UAH 0.01 |
+| `result_callback` | Optional URL |
+| `financial_company_merchant_info.edrpou_code` | Optional string of digits |
+| `financial_company_merchant_info.iban_account` | Optional `UA` followed by 27 digits |
+| `financial_company_merchant_info.store_name` | Optional string |
+| `additional_params.nds` | Optional non-negative VAT amount |
+| `additional_params.ext_initial_sum` | Optional non-negative initial payment |
+| `additional_params.seller_phone` | Optional `+380` followed by nine digits |
+
+Nested objects accept the fields listed above. Monetary values accept at most two decimal places. Local validation checks field types and limits; the bank validates program availability and business rules.
+
+## Monetary values
+
+Request amounts are UAH. Use decimal strings or `Money` for exact amounts:
+
 ```php
-$result = MonoParts::checkPaid($orderId);
-if ($result->fullyPaid) {
-    // success
+use Inkvizitoria\MonoParts\ValueObjects\Money;
+
+$amount = Money::fromDecimal('1234.56');
+$amount->toCents();   // 123456
+$amount->toDecimal(); // '1234.56'
+
+Money::fromCents(100)->toDecimal(); // '1.00'
+Money::fromNumber(100)->toDecimal(); // '100.00'
+```
+
+Integer inputs mean whole UAH, including numeric strings such as `'100'`. Only `fromCents()` interprets its input as kopiykas. Float inputs remain accepted for compatibility, but values with extra precision are rejected rather than rounded. Floats at or above 2^46 UAH are rejected because they cannot reliably distinguish adjacent cent values; use a decimal string instead. Prefer decimal strings to avoid floating-point arithmetic in payment amounts.
+
+`Money` permits zero for report amounts and optional VAT or initial-payment fields. Required prices, refunds and broker amounts must be at least UAH 0.01; an order total must be at least UAH 1.00. Negative amounts and integer overflow are rejected.
+
+The client serializes monetary request fields as JSON numbers with two fractional digits. It builds the body once, signs those bytes and sends the same bytes. It does not turn monetary values into JSON strings.
+
+Response money fields in `OrderShortInfo`, `ReverseEntry` and `DailyReportOrder` are `Money|null`. Missing or unparseable amounts map to `null`. For example:
+
+```php
+$details = MonoParts::orderData($bankOrderId);
+$total = $details->totalSum?->toDecimal();
+```
+
+## API methods
+
+All methods use HTTP POST. Order identifiers passed to order methods must be UUID strings.
+
+| Method | Endpoint | Return type |
+| --- | --- | --- |
+| `createOrder(array $payload)` | `/api/order/create` | `CreateOrderResult` |
+| `checkPaid(string $orderId)` | `/api/order/check/paid` | `CheckPaidResult` |
+| `confirmOrder(string $orderId)` | `/api/order/confirm` | `OrderStateInfo` |
+| `rejectOrder(string $orderId)` | `/api/order/reject` | `OrderStateInfo` |
+| `orderState(string $orderId)` | `/api/order/state` | `OrderStateInfo` |
+| `orderData(string $orderId)` | `/api/order/data` | `OrderShortInfo` |
+| `returnOrder($orderId, $sum, $returnMoneyToCard, $storeReturnId, $additionalParams = [])` | `/api/order/return` | `ReturnResponse` |
+| `storeReport(string $date)` | `/api/store/report` | `DailyReport` |
+| `validateClientV2(?string $phone = null)` | `/api/v2/client/validate` | `ValidateClientResponse` |
+| `brokerAvailability($amount, $employeeId, $inn, $outletId, $phone, $brokerId = null)` | `/api/fin/broker/check/installment/availability` | `InstallmentAvailabilityResponse` |
+| `guaranteeLetterData($orderId, $invoice = [])` | `/api/order/data/for/guarantee/letter` | `GuaranteeLetterData` |
+| `guaranteeLetterDataV2($orderId, $invoice = [])` | `/api/v2/order/data/for/guarantee/letter` | `GuaranteeLetterData` |
+| `guaranteeLetter($orderId, $invoice = [])` | `/api/order/guarantee/letter` | PDF bytes as `string` |
+| `createQrCart(array $payload)` | `/api/v1/qr/cart` | `QrCartResult` |
+| `cancelQrCart(string $qrId)` | `/api/v1/qr/cart/cancel` | `void` |
+
+DTO classes are in `Inkvizitoria\MonoParts\Http\Responses`. The deprecated `/api/order/info` endpoint is not exposed; use `orderData()`.
+
+### Refunds
+
+```php
+$result = MonoParts::returnOrder(
+    orderId: $bankOrderId,
+    sum: '100.00',
+    returnMoneyToCard: true,
+    storeReturnId: 'REFUND-1001',
+    additionalParams: ['nds' => '0.00'],
+);
+
+if ($result->status === \Inkvizitoria\MonoParts\Enums\ReturnStatus::OK) {
+    // Record the accepted refund in your application.
 }
 ```
 
-### Create Order
-- Сигнатура: `MonoParts::createOrder(array $payload): CreateOrderResult`
-- Endpoint: `/api/order/create`
-- Headers: `signature`, `store-id`
-- Returns: `CreateOrderResult { orderId: string }`
-- ResponseStatus: `ORDER_CREATED` або `ORDER_DUPLICATE` (HTTP 409 не кидає виняток)
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
+`$sum` accepts `Money|int|float|string`. `returnMoneyToCard` is a boolean and `storeReturnId` is a non-empty string. Optional refund parameters currently include `nds` only. `checkPaid()` returns `fullyPaid` and `bankCanReturnMoneyToCard`.
 
-Payload приклад:
+### Reports and client eligibility
+
 ```php
-[
-    'store_order_id' => 'ORD-1',
-    'client_phone' => '+380501234567',
-    'total_sum' => 100.25,
-    'invoice' => [
-        'date' => '2024-01-01',
-        'number' => '1',
-        'source' => 'INTERNET',
-        'point_id' => 'P-1',
-    ],
-    'available_programs' => [
-        ['available_parts_count' => [3, 6], 'type' => 'payment_installments'],
-    ],
+$report = MonoParts::storeReport('2026-10-02');
+foreach ($report->orders as $entry) {
+    $transferred = $entry->transferredSum?->toDecimal();
+}
+
+$client = MonoParts::validateClientV2('+380500000001');
+$isClient = $client->found;
+
+$availability = MonoParts::brokerAvailability(
+    amount: '1000.00',
+    employeeId: 'employee-1',
+    inn: '1234567890',
+    outletId: 'outlet-1',
+    phone: '+380500000001',
+);
+```
+
+Report dates use `Y-m-d`. Broker calls use `broker-id` instead of `store-id`; the optional method argument overrides the configured broker ID. The client-validation phone is optional in the bank's schema; an omitted phone produces an empty JSON object.
+
+### Guarantee letters
+
+```php
+$data = MonoParts::guaranteeLetterDataV2($bankOrderId, [
+    'date' => '2026-10-03',
+    'number' => 'INV-1001',
+]);
+
+$header = $data->header;
+$expansion = $data->expansion;
+$originalPayload = $data->raw;
+
+$pdf = MonoParts::guaranteeLetter($bankOrderId);
+return response($pdf, 200)->header('Content-Type', 'application/pdf');
+```
+
+The invoice override is optional and accepts `date` and `number`. Guarantee data retains the bank's nested document fields as arrays; these amounts are not converted to `Money`. The PDF method returns the original binary body and rejects a successful response without a PDF header marker.
+
+### QR carts
+
+```php
+$cart = MonoParts::createQrCart([
+    'qr_id' => 'your-store-qr-id',
+    'store_order_id' => '123e4567-e89b-12d3-a456-426614174000',
     'products' => [
-        ['name' => 'Товар', 'count' => 1, 'sum' => 100.25],
+        ['name' => 'Display', 'count' => 1, 'sum' => '1234.56'],
     ],
-    'result_callback' => 'https://example.com/monoparts/callback',
-    'financial_company_merchant_info' => [
-        'edrpou_code' => '12345678',
-        'iban_account' => 'UA123456789012345678901234567',
-        'store_name' => 'Shop',
-    ],
-    'additional_params' => [
-        'nds' => 1.0,
-        'seller_phone' => '+380501234567',
-        'ext_initial_sum' => 10.0,
-    ],
-]
+    'result_callback' => 'https://shop.example/qr-callback',
+]);
+
+$cartId = $cart->id;
+MonoParts::cancelQrCart('your-store-qr-id');
 ```
 
-Валідація:
-```
-store_order_id: string, 1..64
-client_phone: +380XXXXXXXXX
-total_sum: decimal(2), min 1
-invoice.date: Y-m-d
-invoice.number: string
-invoice.point_id: optional, 1..50
-invoice.source: STORE|INTERNET|CHECKOUT
-available_programs[].available_parts_count[]: int >= 1
-available_programs[].type: payment_installments
-products[].name: string, 1..500
-products[].count: int >= 1
-products[].sum: decimal(2), min 0.01
-result_callback: url (optional)
-financial_company_merchant_info.edrpou_code: digits (optional)
-financial_company_merchant_info.iban_account: UA + 27 digits (optional)
-financial_company_merchant_info.store_name: string (optional)
-additional_params.nds: numeric (optional)
-additional_params.seller_phone: +380XXXXXXXXX (optional)
-additional_params.ext_initial_sum: numeric (optional)
-```
-- Приклад:
+A QR cart requires a UUID `store_order_id` and a callback URL. Product validation follows the price, count and name rules used for orders. Cancellation uses the store's `qr_id`, not the returned cart ID. The bundled callback processor validates order-state payloads; handle any other callback schema in your application.
+
+## Signing
+
+The default signer uses the shared secret issued by the bank:
+
 ```php
-$result = MonoParts::createOrder($payload);
-$orderId = $result->orderId;
+$signature = base64_encode(hash_hmac('sha256', $rawJsonBody, $secret, true));
 ```
 
-### Confirm Order
-- Сигнатура: `MonoParts::confirmOrder(string $orderId): OrderStateInfo`
-- Endpoint: `/api/order/confirm`
-- Payload: `order_id` (UUID-рядок)
-- Returns: `OrderStateInfo`
-- ResponseStatus: `ORDER_SUCCESS`, `ORDER_FAIL`, `ORDER_IN_PROCESS`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
+Requests carry this value in the `signature` header. Callback verification always uses the original request body and a constant-time comparison. Do not decode and re-encode a callback before checking its signature.
+
+To require signatures on HTTP responses, set `MONOPARTS_VERIFY_RESPONSE_SIGNATURE=true`. A missing or invalid response signature then throws `SignatureValidationException`, including for error responses. This option does not control callback verification; callbacks are always verified.
+
+To replace signing, bind `Inkvizitoria\MonoParts\Contracts\SignerInterface` in your application's service provider before resolving the client. Implement `sign()`, `verify()` and `assertValid()`. `assertValid()` must throw `SignatureValidationException` or a subclass for a rejected signature. A custom binding takes precedence over the default signer; changing the driver setting alone does not create a custom implementation.
+
+## Order callbacks
+
+The provider registers `POST /monoparts/callback`, named `monoparts.callback`. It uses the `api` middleware group and returns:
+
+| Status | Meaning |
+| --- | --- |
+| 200 | Signature and payload validated; synchronous listeners completed |
+| 400 | Signed body is not valid JSON or fails payload validation |
+| 403 | Signature is missing or invalid |
+| 500 | Processing or a synchronous event listener failed |
+
+A callback requires a UUID `order_id` and a `state` of `SUCCESS`, `FAIL` or `IN_PROCESS`. `order_sub_state` and `message` are optional strings. Unknown sub-states remain available as `rawOrderSubState`; recognized values also map to `OrderSubState`.
+
+Listen to `CallbackValidated` for application updates:
+
 ```php
-$info = MonoParts::confirmOrder($orderId);
-```
+use Illuminate\Support\Facades\Event;
+use Inkvizitoria\MonoParts\Events\CallbackValidated;
 
-### Reject Order
-- Сигнатура: `MonoParts::rejectOrder(string $orderId): OrderStateInfo`
-- Endpoint: `/api/order/reject`
-- Payload: `order_id` (UUID-рядок)
-- Returns: `OrderStateInfo`
-- ResponseStatus: `ORDER_SUCCESS`, `ORDER_FAIL`, `ORDER_IN_PROCESS`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
-```php
-$info = MonoParts::rejectOrder($orderId);
-```
-
-### Order State
-- Сигнатура: `MonoParts::orderState(string $orderId): OrderStateInfo`
-- Endpoint: `/api/order/state`
-- Payload: `order_id` (UUID-рядок)
-- Returns: `OrderStateInfo`
-- ResponseStatus: `ORDER_SUCCESS`, `ORDER_FAIL`, `ORDER_IN_PROCESS`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
-```php
-$info = MonoParts::orderState($orderId);
-```
-
-### Order Data
-- Сигнатура: `MonoParts::orderData(string $orderId): OrderShortInfo`
-- Endpoint: `/api/order/data`
-- Payload: `order_id` (UUID-рядок)
-- Returns: `OrderShortInfo`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Поля `OrderShortInfo`:
-```
-createTimestamp: DateTimeImmutable|null
-iban: string|null
-invoiceDate: string|null
-invoiceNumber: string|null
-maskedCard: string|null
-pointId: string|null
-reverseList: ReverseEntry[]
-source: string|null
-storeOrderId: string|null
-totalSum: float|null
-```
-- Поля `ReverseEntry`:
-```
-sum: float|null
-timestamp: DateTimeImmutable|null
-```
-- Приклад:
-```php
-$info = MonoParts::orderData($orderId);
-$storeOrderId = $info->storeOrderId;
-```
-
-### Return Order
-- Сигнатура: `MonoParts::returnOrder(string $orderId, float $sum, bool $returnMoneyToCard, string $storeReturnId, array $additionalParams = []): ReturnResponse`
-- Endpoint: `/api/order/return`
-- Payload: `order_id`, `sum`, `return_money_to_card`, `store_return_id`, `additional_params`
-- Returns: `ReturnResponse { status: ReturnStatus, rawStatus: string|null }`
-- ResponseStatus: `RETURN_OK` або `RETURN_ERROR`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
-```php
-$result = MonoParts::returnOrder($orderId, 10.0, true, 'RET-1', ['nds' => 1.5]);
-```
-
-### Store Report
-- Сигнатура: `MonoParts::storeReport(string $date): DailyReport`
-- Endpoint: `/api/store/report`
-- Payload: `date` у форматі `Y-m-d`
-- Returns: `DailyReport` (масив `DailyReportOrder`)
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Поля `DailyReportOrder`:
-```
-cardNumber, commission, commissionPercent, createDateTime, creditSum,
-invoiceNumber, odbContractNumber, operationTimestamp, orderDate, orderId,
-payParts, paymentDate, sentSum, terminalId, totalSum, transactionDate,
-transactionId, transferredSum
-```
-- Приклад:
-```php
-$report = MonoParts::storeReport('2024-01-01');
-$count = count($report->orders);
-```
-
-### Validate Client V2
-- Сигнатура: `MonoParts::validateClientV2(?string $phone = null): ValidateClientResponse`
-- Endpoint: `/api/v2/client/validate`
-- Payload: `phone` (optional, формат `+380XXXXXXXXX`)
-- Returns: `ValidateClientResponse { found: bool }`
-- ResponseStatus: `CLIENT_FOUND` або `CLIENT_NOT_FOUND`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
-```php
-$validation = MonoParts::validateClientV2('+380501234567');
-```
-
-### Broker Availability
-- Сигнатура: `MonoParts::brokerAvailability(float $amount, string $employeeId, string $inn, string $outletId, string $phone, ?string $brokerId = null): InstallmentAvailabilityResponse`
-- Endpoint: `/api/fin/broker/check/installment/availability`
-- Headers: `signature`, `broker-id` (store-id не потрібен)
-- Returns: `InstallmentAvailabilityResponse { available: bool }`
-- ResponseStatus: `AVAILABLE` або `NOT_AVAILABLE`
-- Throws: `PayloadValidationException`, `ApiResponseException`, `TransportException`, `ConfigurationException`
-- Приклад:
-```php
-$availability = MonoParts::brokerAvailability(1000.0, 'emp1', '1234567890', 'outlet1', '+380501234567');
-```
-
-## DTO та статуси
-`MonoPartsResponse` доступний через подію `ResponseReceived`:
-- `status`: `ResponseStatus`
-- `httpStatus`: int
-- `raw`: оригінальний JSON масив або `null`
-- `data`: DTO
-- `headers`: масив заголовків
-
-Приклад доступу до статусу:
-```php
-use Inkvizitoria\MonoParts\Events\ResponseReceived;
-
-Event::listen(ResponseReceived::class, function (ResponseReceived $event) {
-    $status = $event->response->status->value;
-    $raw = $event->response->raw;
+Event::listen(CallbackValidated::class, function (CallbackValidated $event): void {
+    $bankOrderId = $event->stateInfo->orderId;
+    $state = $event->stateInfo->state;
+    // Apply the state to your application's stored order.
 });
 ```
 
-`ResponseStatus`:
-```
-order_success
-order_fail
-order_in_process
-order_created
-order_duplicate
-return_ok
-return_error
-check_paid_yes
-check_paid_no
-available
-not_available
-client_found
-client_not_found
-success_http
-client_error_http
-server_error_http
-```
+Make application updates idempotent. The package does not deduplicate callbacks or persist their state. A queued listener runs after the HTTP acknowledgment; manage its failures through your queue. If a synchronous validated listener throws, the callback returns 500.
 
-`OrderState`:
-```
-SUCCESS
-FAIL
-IN_PROCESS
-```
+Configure `callbacks.enabled`, `callbacks.path` and `callbacks.middleware` in the published config. Set `enabled` to `false` to register your own route and inject `CallbackHandlerInterface`. If you use the `web` middleware group, exempt this callback path from CSRF validation. Keep the configured route publicly reachable at the URL sent in `result_callback`.
 
-`OrderSubState`:
-```
-ADDED
-INTERNAL_INIT
-INTERNAL_INIT_PRE_ACTIVATE
-INTERNAL_INIT_DEBIT
-TESTING
-INTERNAL_ADDED
-INTERNAL_CHECKED
-INTERNAL_WAITING_FOR_IBUS_PDFBOX
-CLIENT_NOT_FOUND
-WRONG_CLIENT_APP_VERSION
-EXCEEDED_SUM_LIMIT
-ACCOUNT_CLOSED
-PAY_PARTS_ARE_NOT_ACCEPTABLE
-CLIENT_CONFIRM_TIME_EXPIRED
-WAITING_FOR_CLIENT
-REJECTED_BY_CLIENT
-REJECTED_BY_STORE
-WAITING_FOR_STORE_CONFIRM
-SUCCESS
-```
+## Events and response metadata
 
-`ReturnStatus`:
-```
-OK
-ERROR
-```
+| Event | Data |
+| --- | --- |
+| `RequestSending` | Endpoint and validated request payload; money fields are `Money` objects |
+| `ResponseReceived` | `MonoPartsResponse` with normalized status, HTTP status, mapped data, raw JSON and headers |
+| `CallbackReceived` | Decoded payload after signature verification, or an empty payload on a signature/decoding failure; emitted once |
+| `CallbackValidated` | Validated payload, signature and `OrderStateInfo` |
+| `CallbackFailed` | Available payload, signature and exception |
 
-## Колбеки
-За замовчуванням маршрут `POST /monoparts/callback` (налаштовується в `monoparts.callbacks`).
+Only `CallbackValidated` represents a validated callback. Do not treat `CallbackReceived` as authorization to update an order.
 
-Правила валідації:
-```
-order_id: UUID
-state: SUCCESS|FAIL|IN_PROCESS
-order_sub_state: [A-Z_]+ (optional)
-message: string (optional)
-```
+Public client methods return their DTOs directly. Use `ResponseReceived` to observe `ResponseStatus` or HTTP metadata. PDF responses have `raw = null` and their bytes in `data`; QR cancellation has `data = null`.
 
-Відповідь колбеку:
-- 200: `{"message":"ok"}`
-- 400: `{"message":"Payload validation failed.","errors":{...}}`
-- 403: `{"message":"Invalid callback signature."}`
-- 500: `{"message":"error"}`
+`ResponseStatus` distinguishes order creation, duplicates, order states, refund results, paid flags, availability and client lookup. Unknown high-level order states are preserved in `rawState` and produce `ORDER_UNKNOWN`, which is not a successful result. `MonoPartsResponse::successful()` describes the normalized result; `ORDER_IN_PROCESS` means processing has started, not that funds have settled.
 
-## Події
-- `RequestSending($endpoint, $payload)`
-- `ResponseReceived(MonoPartsResponse $response)`
-- `CallbackReceived($payload, ?string $signature)`
-- `CallbackValidated($payload, string $signature, ?OrderStateInfo $stateInfo)`
-- `CallbackFailed($payload, ?string $signature, Throwable $exception)`
+## Exceptions
 
-## Винятки
-- `MonoPartsException` — базовий клас для всіх помилок пакета (успадковує `RuntimeException`).
-- `ConfigurationException` — відсутній `store_id` або `broker_id`; кидається перед відправкою запиту.
-- `PayloadValidationException` — невірний payload; містить `errors(): array` з детальними помилками валідації.
-- `ApiResponseException` — Monobank повернув 4xx/5xx (крім 409 для дубля); містить `statusCode: int` і `exceptionResponse: ExceptionResponse` з полем `message`.
-- `TransportException` — транспортна помилка HTTP або непередбачений збій; містить `getPrevious()` з первинним ексепшеном.
-- `SignatureValidationException` — невірний підпис колбеку; використовується в CallbackProcessor.
+All package exceptions extend `Inkvizitoria\MonoParts\Exceptions\MonoPartsException`:
 
-Приклад обробки:
-```php
-use Inkvizitoria\MonoParts\Exceptions\ApiResponseException;
-use Inkvizitoria\MonoParts\Exceptions\MonoPartsException;
-use Inkvizitoria\MonoParts\Exceptions\PayloadValidationException;
-use Inkvizitoria\MonoParts\Exceptions\TransportException;
+| Exception | Cause |
+| --- | --- |
+| `ConfigurationException` | Missing credentials or identifiers, invalid environment, URL, timeout, signature driver or HMAC algorithm |
+| `PayloadValidationException` | Outgoing payload or signed callback failed validation; `errors()` returns errors grouped by field |
+| `ApiResponseException` | Non-success HTTP response, except an order-creation duplicate; exposes `statusCode` and `exceptionResponse` |
+| `TransportException` | Network failure, malformed successful JSON, wrong response field types, missing result ID or invalid PDF |
+| `SignatureValidationException` | Missing or invalid response/callback signature |
+| `InvalidSignatureException` | Invalid signature reported by the default signer; extends `SignatureValidationException` |
 
-try {
-    $order = MonoParts::createOrder($payload);
-} catch (PayloadValidationException $e) {
-    $errors = $e->errors();
-} catch (ApiResponseException $e) {
-    $status = $e->statusCode;
-    $message = $e->exceptionResponse->message;
-} catch (TransportException $e) {
-    $previous = $e->getPrevious();
-} catch (MonoPartsException $e) {
-    // fallback for any other package exception
-}
-```
+Non-JSON API errors retain their HTTP status and use a generic message. Errors from application event listeners are not wrapped as API errors.
 
-## Логи
-Логуються лише службові повідомлення (без payload). Канал задається в `monoparts.logging` і може бути перевизначений через `.env`. Якщо канал відсутній у `logging.channels`, пакет автоматично реєструє його на базі `monoparts.logging.channel_config`.
+## Logging
 
-## Розширення
-- Власний підписувач: забіндьте `SignerInterface` у контейнері або використайте `signature.driver=custom`.
-- Власний обробник колбеку: забіндьте `CallbackHandlerInterface`.
-- Кастомні хедери: `headers.store`, `headers.broker`, `signature.header`.
+The default `monoparts` channel writes request endpoint, HTTP status and normalized status to `storage/logs/monoparts.log`. Callback rejection and validation failures log their reason; unexpected callback failures log the exception. The package does not log outgoing bodies, signing secrets or PDF bytes.
 
-## Тестування
+An existing application channel named `monoparts` is preserved. You can change `logging.channel` or `logging.channel_config`. Logger resolution falls back to `logging.fallback_channel`, then a null logger if a channel cannot be resolved. Event payloads contain customer data; control what your own listeners log.
+
+## Testing
+
 ```bash
+composer install
+composer validate --strict
 composer test
+composer audit
 ```
 
-Інтеграційні тести ходять у реальний sandbox Monobank:
-```
-base: https://u2-demo-ext.mono.st4g3.com
-store-id: test_store_with_confirm
-signature secret: secret_98765432--123-123
+The default suite uses Testbench and fake HTTP responses. It blocks unfaked requests and excludes the `integration` group. CI resolves dependencies independently for Laravel 12 and 13 and runs the suite on the supported PHP versions.
+
+Sandbox integration tests are opt-in. Set the following environment variables in your shell, then run `composer test:integration`:
+
+```dotenv
+MONOPARTS_RUN_INTEGRATION=1
+MONOPARTS_TEST_STORE_ID=your-sandbox-store-id
+MONOPARTS_TEST_SIGNATURE_SECRET=your-sandbox-secret
+MONOPARTS_TEST_PHONE=your-sandbox-test-phone
 ```
 
-Запустити лише інтеграційні:
-```bash
-vendor/bin/phpunit --group integration
-```
+These tests use the fixed sandbox host. Client validation runs when the required variables are present. The create-and-state test also requires `MONOPARTS_TEST_CREATE_ORDER=1`; it creates a sandbox order and leaves that order in the sandbox. The tests are skipped without explicit opt-in and credentials. They do not load a local `.env` file automatically.
 
-Запустити без інтеграційних:
-```bash
-vendor/bin/phpunit --exclude-group integration
-```
+## License and author
 
-## Автор
-Drozh Denis (DD) — `inkvizitoria/laravel-monoparts`.
+MIT. See [LICENSE](LICENSE).
+
+Maintained by [Denis Drozh](https://github.com/Inkvizitoria). Report reproducible issues at [GitHub Issues](https://github.com/Inkvizitoria/laravel-monoparts/issues).

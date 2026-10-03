@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Inkvizitoria\MonoParts\Tests;
 
 use Inkvizitoria\MonoParts\Events\CallbackValidated;
+use Inkvizitoria\MonoParts\Security\JsonBodyBuilder;
+use Inkvizitoria\MonoParts\Security\Signer;
 use Illuminate\Support\Facades\Event;
 
 final class CallbackProcessorTest extends TestCase
@@ -19,14 +21,17 @@ final class CallbackProcessorTest extends TestCase
             'order_sub_state' => 'SUCCESS',
         ];
 
-        $signer = new \Inkvizitoria\MonoParts\Support\HmacSigner('secret');
-        $signature = $signer->sign($payload);
+        $builder = $this->app->make(JsonBodyBuilder::class);
+        $rawBody = $builder->build($payload);
+        $signer = new Signer('secret');
+        $signature = $signer->sign($rawBody);
 
         Event::fake();
 
-        $response = $this->postJson('/monoparts/callback', $payload, [
-            'signature' => $signature,
-        ]);
+        $response = $this->call('POST', '/monoparts/callback', [], [], [], [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_signature' => $signature,
+        ], $rawBody);
 
         $response->assertStatus(200);
         Event::assertDispatched(CallbackValidated::class, function (CallbackValidated $event) use ($payload): bool {
@@ -43,12 +48,15 @@ final class CallbackProcessorTest extends TestCase
         $payload = [
             'order_id' => '123e4567-e89b-12d3-a456-426614174000',
         ];
-        $signer = new \Inkvizitoria\MonoParts\Support\HmacSigner('secret');
-        $signature = $signer->sign($payload);
+        $builder = $this->app->make(JsonBodyBuilder::class);
+        $rawBody = $builder->build($payload);
+        $signer = new Signer('secret');
+        $signature = $signer->sign($rawBody);
 
-        $response = $this->postJson('/monoparts/callback', $payload, [
-            'signature' => $signature,
-        ]);
+        $response = $this->call('POST', '/monoparts/callback', [], [], [], [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_signature' => $signature,
+        ], $rawBody);
 
         $response->assertStatus(400);
     }
@@ -62,9 +70,13 @@ final class CallbackProcessorTest extends TestCase
             'state' => 'SUCCESS',
         ];
 
-        $response = $this->postJson('/monoparts/callback', $payload, [
-            'signature' => 'invalid-signature',
-        ]);
+        $builder = $this->app->make(JsonBodyBuilder::class);
+        $rawBody = $builder->build($payload);
+
+        $response = $this->call('POST', '/monoparts/callback', [], [], [], [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_signature' => 'invalid-signature',
+        ], $rawBody);
 
         $response->assertStatus(403);
     }

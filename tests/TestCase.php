@@ -9,9 +9,10 @@ use Orchestra\Testbench\TestCase as Orchestra;
 
 abstract class TestCase extends Orchestra
 {
-    public static function applicationBasePath(): string
+    protected function setUp(): void
     {
-        return realpath(__DIR__ . '/workbench') ?: __DIR__ . '/workbench';
+        parent::setUp();
+        \Illuminate\Support\Facades\Http::preventStrayRequests();
     }
 
     protected function getPackageProviders($app): array

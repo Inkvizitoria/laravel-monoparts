@@ -23,12 +23,14 @@ final class SupportTest extends TestCase
             signatureHeader: 'signature',
             storeHeader: 'store-id',
             brokerId: null,
+            verifyResponseSignature: false,
         );
 
         $factory = new SignatureFactory($this->app);
         $signer = $factory->make($config, ['driver' => 'hmac', 'algo' => 'sha256']);
 
-        $this->assertTrue($signer->verify(['foo' => 'bar'], $signer->sign(['foo' => 'bar'])));
+        $body = '{"foo":"bar"}';
+        $this->assertTrue($signer->verify($body, $signer->sign($body)));
     }
 
     public function test_signature_factory_throws_on_unknown_driver(): void
@@ -41,11 +43,12 @@ final class SupportTest extends TestCase
             signatureHeader: 'signature',
             storeHeader: 'store-id',
             brokerId: null,
+            verifyResponseSignature: false,
         );
 
         $factory = new SignatureFactory(new \Illuminate\Container\Container());
 
-        $this->expectException(\InvalidArgumentException::class);
+        $this->expectException(\Inkvizitoria\MonoParts\Exceptions\ConfigurationException::class);
         $factory->make($config, ['driver' => 'unknown']);
     }
 
@@ -59,18 +62,26 @@ final class SupportTest extends TestCase
             signatureHeader: 'signature',
             storeHeader: 'store-id',
             brokerId: null,
+            verifyResponseSignature: false,
         );
 
         $container = new \Illuminate\Container\Container();
         $dummySigner = new class implements \Inkvizitoria\MonoParts\Contracts\SignerInterface {
-            public function sign(array $payload): string
+            public function sign(string $body): string
             {
                 return 'dummy';
             }
 
-            public function verify(array $payload, string $signature): bool
+            public function verify(string $body, string $signature): bool
             {
                 return $signature === 'dummy';
+            }
+
+            public function assertValid(string $body, string $signature): void
+            {
+                if ($signature !== 'dummy') {
+                    throw new \RuntimeException('invalid');
+                }
             }
         };
         $container->instance(\Inkvizitoria\MonoParts\Contracts\SignerInterface::class, $dummySigner);

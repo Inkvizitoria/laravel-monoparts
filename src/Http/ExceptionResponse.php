@@ -19,6 +19,6 @@ final class ExceptionResponse
      */
     public static function fromPayload(?array $payload): self
     {
-        return new self($payload['message'] ?? null);
+        return new self(is_string($payload['message'] ?? null) ? $payload['message'] : null);
     }
 }

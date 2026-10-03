@@ -8,6 +8,7 @@ use Inkvizitoria\MonoParts\Exceptions\ApiResponseException;
 use Inkvizitoria\MonoParts\Exceptions\ConfigurationException;
 use Inkvizitoria\MonoParts\Exceptions\PayloadValidationException;
 use Inkvizitoria\MonoParts\Http\MonoPartsClient;
+use Inkvizitoria\MonoParts\Security\JsonBodyBuilder;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -37,15 +38,15 @@ final class ClientTest extends TestCase
         $this->assertTrue($response->bankCanReturnMoneyToCard);
 
         Http::assertSent(function (Request $request): bool {
-            /** @var array<string, mixed> $body */
-            $body = $request->data();
-            $expectedSignature = base64_encode(hash_hmac('sha256', json_encode([
+            $builder = app(JsonBodyBuilder::class);
+            $expectedBody = $builder->build([
                 'order_id' => '123e4567-e89b-12d3-a456-426614174000',
-            ], JSON_THROW_ON_ERROR), 'secret', true));
+            ]);
+            $expectedSignature = base64_encode(hash_hmac('sha256', $expectedBody, 'secret', true));
 
             return $request->hasHeader('store-id', 'store-1')
                 && $request->hasHeader('signature', $expectedSignature)
-                && $body['order_id'] === '123e4567-e89b-12d3-a456-426614174000';
+                && $request->body() === $expectedBody;
         });
     }
 
@@ -440,29 +441,14 @@ final class ClientTest extends TestCase
         $this->assertSame(\Inkvizitoria\MonoParts\Status\ResponseStatus::RETURN_OK, $capturedStatus);
     }
 
-    public function test_transport_exception_is_thrown_for_request_exception(): void
+    public function test_transport_exception_is_thrown_for_connection_exception(): void
     {
         $this->app['config']->set('monoparts.merchant.signature_secret', 'secret');
         $this->app['config']->set('monoparts.merchant.store_id', 'store-1');
 
-        $http = new class extends \Illuminate\Http\Client\Factory {
-            public function withHeaders($headers): self
-            {
-                return $this;
-            }
-
-            public function post($url, $data = [])
-            {
-                $psr = new \GuzzleHttp\Psr7\Response(500, [], 'error');
-                $response = new \Illuminate\Http\Client\Response($psr);
-                throw new \Illuminate\Http\Client\RequestException($response);
-            }
-        };
-
-        $this->app->instance('http', $http);
-        $this->app->forgetInstance(MonoPartsClient::class);
-
-        /** @var MonoPartsClient $client */
+        Http::fake(function () {
+            throw new \Illuminate\Http\Client\ConnectionException('Connection timed out.');
+        });
         $client = $this->app->make(MonoPartsClient::class);
 
         $this->expectException(\Inkvizitoria\MonoParts\Exceptions\TransportException::class);
@@ -474,22 +460,9 @@ final class ClientTest extends TestCase
         $this->app['config']->set('monoparts.merchant.signature_secret', 'secret');
         $this->app['config']->set('monoparts.merchant.store_id', 'store-1');
 
-        $http = new class extends \Illuminate\Http\Client\Factory {
-            public function withHeaders($headers): self
-            {
-                return $this;
-            }
-
-            public function post($url, $data = [])
-            {
-                throw new \RuntimeException('boom');
-            }
-        };
-
-        $this->app->instance('http', $http);
-        $this->app->forgetInstance(MonoPartsClient::class);
-
-        /** @var MonoPartsClient $client */
+        Http::fake(function () {
+            throw new \RuntimeException('boom');
+        });
         $client = $this->app->make(MonoPartsClient::class);
 
         $this->expectException(\Inkvizitoria\MonoParts\Exceptions\TransportException::class);
@@ -540,5 +513,32 @@ final class ClientTest extends TestCase
 
         $monoServerError = $reflector->invoke($client, $request, $responseServerError);
         $this->assertSame(\Inkvizitoria\MonoParts\Status\ResponseStatus::SERVER_ERROR_HTTP, $monoServerError->status);
+    }
+
+    public function test_response_signature_verification_can_be_enabled(): void
+    {
+        $this->app['config']->set('monoparts.merchant.signature_secret', 'secret');
+        $this->app['config']->set('monoparts.merchant.store_id', 'store-1');
+        $this->app['config']->set('monoparts.verify_response_signature', true);
+
+        $payload = [
+            'fully_paid' => true,
+            'bank_can_return_money_to_card' => true,
+        ];
+
+        $body = json_encode($payload, JSON_THROW_ON_ERROR);
+        $signature = base64_encode(hash_hmac('sha256', $body, 'secret', true));
+
+        Http::fake([
+            'https://example.test/api/order/check/paid' => Http::response($payload, 200, [
+                'signature' => $signature,
+            ]),
+        ]);
+
+        /** @var MonoPartsClient $client */
+        $client = $this->app->make(MonoPartsClient::class);
+        $result = $client->checkPaid('123e4567-e89b-12d3-a456-426614174000');
+
+        $this->assertTrue($result->fullyPaid);
     }
 }

@@ -7,6 +7,6 @@ namespace Inkvizitoria\MonoParts\Exceptions;
 /**
  * Raised when callback signature or request signing fails verification.
  */
-final class SignatureValidationException extends MonoPartsException
+class SignatureValidationException extends MonoPartsException
 {
 }

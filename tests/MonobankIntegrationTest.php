@@ -11,27 +11,37 @@ use Inkvizitoria\MonoParts\Http\MonoPartsClient;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Support\Facades\Http;
 
-/**
- * @group integration
- */
+#[\PHPUnit\Framework\Attributes\Group('integration')]
 final class MonobankIntegrationTest extends TestCase
 {
     private const SANDBOX_BASE_URL = 'https://u2-demo-ext.mono.st4g3.com';
-    private const STORE_ID = 'test_store_with_confirm';
-    private const SIGNATURE_SECRET = 'secret_98765432--123-123';
-    private const TEST_PHONE = '+380931234561';
+    protected function setUp(): void
+    {
+        parent::setUp();
+        if (getenv('MONOPARTS_RUN_INTEGRATION') !== '1') {
+            $this->markTestSkipped('Set MONOPARTS_RUN_INTEGRATION=1 to enable sandbox requests.');
+        }
+        foreach (['MONOPARTS_TEST_STORE_ID', 'MONOPARTS_TEST_SIGNATURE_SECRET', 'MONOPARTS_TEST_PHONE'] as $key) {
+            if (!getenv($key)) {
+                $this->markTestSkipped($key . ' is required for sandbox integration tests.');
+            }
+        }
+    }
 
     public function test_validate_client_v2_calls_monobank(): void
     {
         $client = $this->makeClient();
 
-        $response = $client->validateClientV2(self::TEST_PHONE);
+        $response = $client->validateClientV2((string) getenv('MONOPARTS_TEST_PHONE'));
 
         $this->assertIsBool($response->found);
     }
 
     public function test_create_order_and_order_state_calls_monobank(): void
     {
+        if (getenv('MONOPARTS_TEST_CREATE_ORDER') !== '1') {
+            $this->markTestSkipped('Set MONOPARTS_TEST_CREATE_ORDER=1 to create a sandbox order.');
+        }
         $client = $this->makeClient();
         $payload = $this->buildCreatePayload();
 
@@ -51,8 +61,8 @@ final class MonobankIntegrationTest extends TestCase
 
         return [
             'store_order_id' => $uniqueId,
-            'client_phone' => self::TEST_PHONE,
-            'total_sum' => 100.00,
+            'client_phone' => (string) getenv('MONOPARTS_TEST_PHONE'),
+            'total_sum' => '100.00',
             'invoice' => [
                 'date' => date('Y-m-d'),
                 'number' => $uniqueId,
@@ -62,7 +72,7 @@ final class MonobankIntegrationTest extends TestCase
                 ['available_parts_count' => [3], 'type' => 'payment_installments'],
             ],
             'products' => [
-                ['name' => 'Test product', 'count' => 1, 'sum' => 100.00],
+                ['name' => 'Test product', 'count' => 1, 'sum' => '100.00'],
             ],
         ];
     }
@@ -75,8 +85,8 @@ final class MonobankIntegrationTest extends TestCase
             Environment::STAGE->value => 'https://u2-ext.mono.st4g3.com',
         ]);
         $this->app['config']->set('monoparts.production_url', 'https://u2.monobank.com.ua');
-        $this->app['config']->set('monoparts.merchant.store_id', self::STORE_ID);
-        $this->app['config']->set('monoparts.merchant.signature_secret', self::SIGNATURE_SECRET);
+        $this->app['config']->set('monoparts.merchant.store_id', (string) getenv('MONOPARTS_TEST_STORE_ID'));
+        $this->app['config']->set('monoparts.merchant.signature_secret', (string) getenv('MONOPARTS_TEST_SIGNATURE_SECRET'));
         $this->app['config']->set('monoparts.signature.header', 'signature');
 
         $factory = new Factory();

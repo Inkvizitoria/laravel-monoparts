@@ -1,57 +1,68 @@
 {
     "name": "inkvizitoria/laravel-monoparts",
-    "description": "Laravel package for monobank \"Покупка частинами\" integration (order lifecycle, callbacks, signing, logging) by Drozh Denis (DD).",
-    "version": "1.0.0",
+    "description": "Laravel integration for monobank installment payments: orders, refunds, guarantee letters, QR carts and signed callbacks.",
     "type": "library",
     "license": "MIT",
     "authors": [
         {
-            "name": "Drozh Denis (DD)",
-            "email": "adskay2010@gmail.com"
+            "name": "Denis Drozh",
+            "email": "adskay2010@gmail.com",
+            "homepage": "https://github.com/Inkvizitoria",
+            "role": "Developer"
         }
     ],
     "require": {
-        "php": "^8.1",
+        "php": "^8.2",
         "ext-json": "*",
-        "illuminate/contracts": "^8.0|^9.0|^10.0|^11.0|^12.0",
-        "illuminate/support": "^8.0|^9.0|^10.0|^11.0|^12.0",
-        "illuminate/http": "^8.0|^9.0|^10.0|^11.0|^12.0",
-        "illuminate/events": "^8.0|^9.0|^10.0|^11.0|^12.0",
-        "illuminate/log": "^8.0|^9.0|^10.0|^11.0|^12.0"
+        "illuminate/contracts": "^12.0 || ^13.0",
+        "illuminate/support": "^12.0 || ^13.0",
+        "illuminate/http": "^12.0 || ^13.0",
+        "illuminate/events": "^12.0 || ^13.0",
+        "illuminate/log": "^12.0 || ^13.0",
+        "illuminate/validation": "^12.0 || ^13.0",
+        "guzzlehttp/guzzle": "^7.8",
+        "psr/log": "^1.1 || ^2.0 || ^3.0"
     },
     "require-dev": {
-        "orchestra/testbench": "^6.0|^7.0|^8.0|^9.0|^10.0",
-        "phpunit/phpunit": "^9.6|^10.0"
+        "orchestra/testbench": "^10.0 || ^11.0",
+        "phpunit/phpunit": "^11.5"
     },
     "autoload": {
         "psr-4": {
-            "Inkvizitoria\\\\MonoParts\\\\": "src/"
-        },
-        "classmap": [
-            "src/"
-        ]
+            "Inkvizitoria\\MonoParts\\": "src/"
+        }
     },
     "autoload-dev": {
         "psr-4": {
-            "Inkvizitoria\\\\MonoParts\\\\Tests\\\\": "tests/"
-        },
-        "classmap": [
-            "tests/TestCase.php"
-        ]
+            "Inkvizitoria\\MonoParts\\Tests\\": "tests/"
+        }
     },
     "scripts": {
-        "test": "vendor/bin/phpunit"
+        "test": "phpunit --exclude-group integration",
+        "test:integration": "phpunit -c phpunit.integration.xml --group integration"
     },
     "minimum-stability": "stable",
     "prefer-stable": true,
     "extra": {
         "laravel": {
             "providers": [
-                "Inkvizitoria\\\\MonoParts\\\\Providers\\\\MonoPartsServiceProvider"
+                "Inkvizitoria\\MonoParts\\Providers\\MonoPartsServiceProvider"
             ],
             "aliases": {
-                "MonoParts": "Inkvizitoria\\\\MonoParts\\\\Facades\\\\MonoParts"
+                "MonoParts": "Inkvizitoria\\MonoParts\\Facades\\MonoParts"
             }
         }
+    },
+    "keywords": [
+        "laravel",
+        "monobank",
+        "installments",
+        "payments",
+        "ukraine"
+    ],
+    "homepage": "https://github.com/Inkvizitoria/laravel-monoparts",
+    "support": {
+        "issues": "https://github.com/Inkvizitoria/laravel-monoparts/issues",
+        "source": "https://github.com/Inkvizitoria/laravel-monoparts"
     }
 }

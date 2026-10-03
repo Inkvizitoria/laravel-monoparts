@@ -17,6 +17,7 @@ final class ConfigTest extends TestCase
         $this->assertSame('https://example.test', $config->baseUrl);
         $this->assertSame('signature', $config->signatureHeader);
         $this->assertSame('store-id', $config->storeHeader);
+        $this->assertFalse($config->verifyResponseSignature);
     }
 
     public function test_resolves_non_production_url(): void
@@ -34,6 +35,7 @@ final class ConfigTest extends TestCase
             'signature' => [
                 'header' => 'signature',
             ],
+            'verify_response_signature' => true,
             'headers' => [
                 'store' => 'store-id',
                 'broker' => 'broker-id',
@@ -42,11 +44,12 @@ final class ConfigTest extends TestCase
 
         $this->assertSame(Environment::SANDBOX, $config->environment);
         $this->assertSame('https://sandbox.test', $config->baseUrl);
+        $this->assertTrue($config->verifyResponseSignature);
     }
 
     public function test_throws_when_base_url_missing(): void
     {
-        $this->expectException(\InvalidArgumentException::class);
+        $this->expectException(\Inkvizitoria\MonoParts\Exceptions\ConfigurationException::class);
 
         MonoPartsConfig::fromArray([
             'environment' => Environment::STAGE->value,
@@ -58,6 +61,7 @@ final class ConfigTest extends TestCase
             'signature' => [
                 'header' => 'signature',
             ],
+            'verify_response_signature' => false,
             'headers' => [
                 'store' => 'store-id',
                 'broker' => 'broker-id',

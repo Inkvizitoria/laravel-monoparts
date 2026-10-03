@@ -1,0 +1,8 @@
+* text=auto eol=lf
+/.github export-ignore
+/tests export-ignore
+/phpunit.xml export-ignore
+/phpunit.integration.xml export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/.env.example export-ignore

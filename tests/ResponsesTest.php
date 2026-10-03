@@ -15,6 +15,7 @@ use Inkvizitoria\MonoParts\Http\Responses\OrderStateInfo;
 use Inkvizitoria\MonoParts\Http\Responses\ReverseEntry;
 use Inkvizitoria\MonoParts\Http\Responses\ValidateClientResponse;
 use Inkvizitoria\MonoParts\Enums\OrderState;
+use Inkvizitoria\MonoParts\ValueObjects\Money;
 
 final class ResponsesTest extends TestCase
 {
@@ -50,7 +51,8 @@ final class ResponsesTest extends TestCase
             'timestamp' => '2021-06-16T16:49:51',
         ]);
 
-        $this->assertSame(10.5, $reverse->sum);
+        $this->assertInstanceOf(Money::class, $reverse->sum);
+        $this->assertSame('10.50', $reverse->sum?->toDecimal());
         $this->assertNotNull($reverse->timestamp);
 
         $info = OrderShortInfo::fromPayload([
@@ -70,7 +72,8 @@ final class ResponsesTest extends TestCase
 
         $this->assertSame('UA123', $info->iban);
         $this->assertCount(1, $info->reverseList);
-        $this->assertSame(99.99, $info->totalSum);
+        $this->assertInstanceOf(Money::class, $info->totalSum);
+        $this->assertSame('99.99', $info->totalSum?->toDecimal());
     }
 
     public function test_order_state_info_parsing(): void
@@ -119,6 +122,7 @@ final class ResponsesTest extends TestCase
         ]);
 
         $this->assertSame('ORD-1', $order->orderId);
+        $this->assertInstanceOf(Money::class, $order->commission);
 
         $report = DailyReport::fromPayload(['orders' => [
             [

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Inkvizitoria\MonoParts\Tests;
 
 use Inkvizitoria\MonoParts\Contracts\SignerInterface;
+use Inkvizitoria\MonoParts\Security\JsonBodyBuilder;
 
 final class CallbackProcessorErrorTest extends TestCase
 {
@@ -12,12 +13,17 @@ final class CallbackProcessorErrorTest extends TestCase
     {
         $this->app->bind(SignerInterface::class, function (): SignerInterface {
             return new class implements SignerInterface {
-                public function sign(array $payload): string
+                public function sign(string $body): string
                 {
                     throw new \RuntimeException('boom');
                 }
 
-                public function verify(array $payload, string $signature): bool
+                public function verify(string $body, string $signature): bool
+                {
+                    throw new \RuntimeException('boom');
+                }
+
+                public function assertValid(string $body, string $signature): void
                 {
                     throw new \RuntimeException('boom');
                 }
@@ -29,9 +35,13 @@ final class CallbackProcessorErrorTest extends TestCase
             'state' => 'SUCCESS',
         ];
 
-        $response = $this->postJson('/monoparts/callback', $payload, [
-            'signature' => 'any',
-        ]);
+        $builder = $this->app->make(JsonBodyBuilder::class);
+        $rawBody = $builder->build($payload);
+
+        $response = $this->call('POST', '/monoparts/callback', [], [], [], [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_signature' => 'any',
+        ], $rawBody);
 
         $response->assertStatus(500);
     }

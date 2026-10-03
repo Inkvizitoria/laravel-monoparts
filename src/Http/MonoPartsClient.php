@@ -32,6 +32,7 @@ use Inkvizitoria\MonoParts\Http\Responses\OrderShortInfo;
 use Inkvizitoria\MonoParts\Http\Responses\OrderStateInfo;
 use Inkvizitoria\MonoParts\Http\Responses\ReturnResponse;
 use Inkvizitoria\MonoParts\Http\Responses\ValidateClientResponse;
+use Inkvizitoria\MonoParts\Security\JsonBodyBuilder;
 use Inkvizitoria\MonoParts\Support\MonoPartsLogger;
 use Inkvizitoria\MonoParts\Status\ResponseStatus;
 use Illuminate\Contracts\Events\Dispatcher;
@@ -39,7 +40,14 @@ use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Validation\ValidationException;
+use Inkvizitoria\MonoParts\Http\Requests\GuaranteeLetterRequest;
+use Inkvizitoria\MonoParts\Http\Requests\GuaranteeLetterDataRequest;
+use Inkvizitoria\MonoParts\Http\Requests\CreateQrCartRequest;
+use Inkvizitoria\MonoParts\Http\Requests\CancelQrCartRequest;
+use Inkvizitoria\MonoParts\Http\Responses\GuaranteeLetterData;
+use Inkvizitoria\MonoParts\Http\Responses\QrCartResult;
 use Throwable;
+use Inkvizitoria\MonoParts\ValueObjects\Money;
 
 final class MonoPartsClient
 {
@@ -49,6 +57,7 @@ final class MonoPartsClient
         private readonly SignerInterface $signer,
         private readonly Dispatcher $events,
         private readonly MonoPartsLogger $logger,
+        private readonly JsonBodyBuilder $bodyBuilder,
     ) {
     }
 
@@ -136,13 +145,13 @@ final class MonoPartsClient
      * Apply full or partial return.
      *
      * @param string $orderId
-     * @param float $sum
+     * @param Money|int|float|string $sum
      * @param bool $returnMoneyToCard
      * @param string $storeReturnId
      * @param array<string, mixed> $additionalParams
      * @return ReturnResponse
      */
-    public function returnOrder(string $orderId, float $sum, bool $returnMoneyToCard, string $storeReturnId, array $additionalParams = []): ReturnResponse
+    public function returnOrder(string $orderId, Money|int|float|string $sum, bool $returnMoneyToCard, string $storeReturnId, array $additionalParams = []): ReturnResponse
     {
         $response = $this->send(new ReturnOrderRequest(
             orderId: $orderId,
@@ -209,7 +218,7 @@ final class MonoPartsClient
     /**
      * Check installment availability for brokers.
      *
-     * @param float $amount
+     * @param Money|int|float|string $amount
      * @param string $employeeId
      * @param string $inn
      * @param string $outletId
@@ -217,7 +226,7 @@ final class MonoPartsClient
      * @param string|null $brokerId
      * @return InstallmentAvailabilityResponse
      */
-    public function brokerAvailability(float $amount, string $employeeId, string $inn, string $outletId, string $phone, ?string $brokerId = null): InstallmentAvailabilityResponse
+    public function brokerAvailability(Money|int|float|string $amount, string $employeeId, string $inn, string $outletId, string $phone, ?string $brokerId = null): InstallmentAvailabilityResponse
     {
         $response = $this->send(new BrokerAvailabilityRequest(
             amount: $amount,
@@ -232,6 +241,34 @@ final class MonoPartsClient
         $dto = $response->data;
 
         return $dto;
+    }
+
+    /** @param array{date?: string, number?: string} $invoice */
+    public function guaranteeLetterData(string $orderId, array $invoice = []): GuaranteeLetterData
+    {
+        return $this->send(new GuaranteeLetterDataRequest($orderId, $invoice))->data;
+    }
+
+    /** @param array{date?: string, number?: string} $invoice */
+    public function guaranteeLetterDataV2(string $orderId, array $invoice = []): GuaranteeLetterData
+    {
+        return $this->send(new GuaranteeLetterDataRequest($orderId, $invoice, true))->data;
+    }
+
+    /** Return the original PDF bytes. */
+    public function guaranteeLetter(string $orderId, array $invoice = []): string
+    {
+        return $this->send(new GuaranteeLetterRequest($orderId, $invoice))->data;
+    }
+
+    public function createQrCart(array $payload): QrCartResult
+    {
+        return $this->send(new CreateQrCartRequest($payload))->data;
+    }
+
+    public function cancelQrCart(string $qrId): void
+    {
+        $this->send(new CancelQrCartRequest($qrId));
     }
 
     /**
@@ -252,23 +289,44 @@ final class MonoPartsClient
 
         $this->events->dispatch(new RequestSending($request->endpoint(), $validatedPayload));
 
-        $signature = $this->signer->sign($validatedPayload);
+        try {
+            $body = $this->bodyBuilder->build($validatedPayload);
+        } catch (\JsonException|\InvalidArgumentException $e) {
+            throw new PayloadValidationException(['body' => [$e->getMessage()]], 'Unable to encode request payload.');
+        }
+        $signature = $this->signer->sign($body);
         $headers = $this->defaultHeaders($request, $signature);
 
         $url = $this->config->baseUrl . $request->endpoint();
 
         try {
-            $response = $this->http->withHeaders($headers)->post($url, $validatedPayload);
+            $response = $this->http
+                ->withHeaders($headers)
+                ->withBody($body, 'application/json')
+                ->timeout($this->config->timeout)
+                ->connectTimeout($this->config->connectTimeout)
+                ->post($url);
         } catch (RequestException $e) {
             throw new TransportException('Failed to call Monobank API: ' . $e->getMessage(), $e);
         } catch (Throwable $e) {
             throw new TransportException('Unexpected transport error: ' . $e->getMessage(), $e);
         }
 
+        if ($this->config->verifyResponseSignature) {
+            $responseSignature = (string) $response->header($this->config->signatureHeader);
+            if ($responseSignature === '') {
+                throw new \Inkvizitoria\MonoParts\Exceptions\SignatureValidationException('Missing response signature.');
+            }
+            if (!$this->signer->verify($response->body(), $responseSignature)) {
+                throw new \Inkvizitoria\MonoParts\Exceptions\SignatureValidationException('Invalid response signature.');
+            }
+        }
+
         $isDuplicateCreate = $request instanceof CreateOrderRequest && $response->status() === 409;
 
         if (!$response->successful() && !$isDuplicateCreate) {
-            $exceptionResponse = ExceptionResponse::fromPayload($response->json());
+            $errorPayload = $response->json();
+            $exceptionResponse = ExceptionResponse::fromPayload(is_array($errorPayload) ? $errorPayload : null);
             throw new ApiResponseException($response->status(), $exceptionResponse);
         }
 
@@ -319,7 +377,11 @@ final class MonoPartsClient
      */
     private function buildResponse(MonoPartsRequest $request, Response $response): MonoPartsResponse
     {
-        $data = $this->mapResponse($request, $response);
+        try {
+            $data = $this->mapResponse($request, $response);
+        } catch (\TypeError|\ValueError $e) {
+            throw new TransportException('Monobank API returned an invalid response shape.', $e);
+        }
         $status = $this->determineStatus($request, $response, $data);
 
         return MonoPartsResponse::fromHttp($response, $status, $data);
@@ -330,9 +392,77 @@ final class MonoPartsClient
      */
     private function mapResponse(MonoPartsRequest $request, Response $response): mixed
     {
+        if ($request instanceof GuaranteeLetterRequest) {
+            if (!str_starts_with($response->body(), '%PDF-')) {
+                throw new TransportException('Monobank API returned an invalid PDF document.');
+            }
+
+            return $response->body();
+        }
+        if ($request instanceof CancelQrCartRequest) {
+            return null;
+        }
+
+        try {
+            $object = json_decode($response->body(), false, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new TransportException('Monobank API returned invalid JSON.', $e);
+        }
+        if (!$object instanceof \stdClass) {
+            throw new TransportException('Monobank API response must be a JSON object.');
+        }
         $payload = $response->json();
+        $booleanFields = match (true) {
+            $request instanceof CheckPaidRequest => ['fully_paid', 'bank_can_return_money_to_card'],
+            $request instanceof ClientValidateV2Request => ['found'],
+            $request instanceof BrokerAvailabilityRequest => ['available'],
+            default => [],
+        };
+        foreach ($booleanFields as $field) {
+            if (!is_bool($payload[$field] ?? null)) {
+                throw new TransportException('Monobank API response is missing a boolean field: ' . $field);
+            }
+        }
+        $stringFields = match (true) {
+            $request instanceof OrderStateRequest, $request instanceof ConfirmOrderRequest,
+            $request instanceof RejectOrderRequest => ['order_id', 'state'],
+            $request instanceof OrderDataRequest => ['store_order_id'],
+            $request instanceof ReturnOrderRequest => ['status'],
+            default => [],
+        };
+        foreach ($stringFields as $field) {
+            if (!is_string($payload[$field] ?? null) || $payload[$field] === '') {
+                throw new TransportException('Monobank API response is missing a string field: ' . $field);
+            }
+        }
+        if ($request instanceof StoreReportRequest) {
+            if (!is_array($object->orders ?? null)) {
+                throw new TransportException('Monobank report response is missing the orders list.');
+            }
+            foreach ($object->orders as $entry) {
+                if (!$entry instanceof \stdClass || !is_string($entry->order_id ?? null) || $entry->order_id === '') {
+                    throw new TransportException('Monobank report contains an invalid order entry.');
+                }
+            }
+        }
+        if ($request instanceof GuaranteeLetterDataRequest) {
+            if (!(($object->header ?? null) instanceof \stdClass)
+                || (isset($object->expansion) && !$object->expansion instanceof \stdClass)) {
+                throw new TransportException('Monobank guarantee data response has an invalid document structure.');
+            }
+        }
+
+        if ($request instanceof CreateOrderRequest && (!is_string($payload['order_id'] ?? null) || $payload['order_id'] === '')) {
+            throw new TransportException('Monobank create response is missing order_id.');
+        }
+
+        if ($request instanceof CreateQrCartRequest && (!is_string($payload['id'] ?? null) || $payload['id'] === '')) {
+            throw new TransportException('Monobank QR cart response is missing id.');
+        }
 
         return match (true) {
+            $request instanceof GuaranteeLetterDataRequest => GuaranteeLetterData::fromPayload($payload),
+            $request instanceof CreateQrCartRequest => QrCartResult::fromPayload($payload),
             $request instanceof CheckPaidRequest => CheckPaidResult::fromPayload((array) $payload),
             $request instanceof CreateOrderRequest => CreateOrderResult::fromPayload((array) $payload),
             $request instanceof ConfirmOrderRequest,
@@ -356,6 +486,10 @@ final class MonoPartsClient
                 \Inkvizitoria\MonoParts\Enums\OrderState::FAIL => ResponseStatus::ORDER_FAIL,
                 \Inkvizitoria\MonoParts\Enums\OrderState::IN_PROCESS => ResponseStatus::ORDER_IN_PROCESS,
             };
+        }
+
+        if ($data instanceof OrderStateInfo) {
+            return ResponseStatus::ORDER_UNKNOWN;
         }
 
         if ($data instanceof ReturnResponse) {

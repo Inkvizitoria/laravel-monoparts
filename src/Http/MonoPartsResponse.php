@@ -29,7 +29,7 @@ final class MonoPartsResponse
         return new self(
             status: $status,
             httpStatus: $response->status(),
-            raw: $response->json(),
+            raw: is_array($response->json()) ? $response->json() : null,
             data: $data,
             headers: $response->headers(),
         );

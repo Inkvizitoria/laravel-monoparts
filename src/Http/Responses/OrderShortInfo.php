@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Inkvizitoria\MonoParts\Http\Responses;
 
 use DateTimeImmutable;
+use Inkvizitoria\MonoParts\ValueObjects\Money;
 
 /**
  * Short order info returned by /api/order/data.
@@ -24,7 +25,7 @@ final class OrderShortInfo
         public readonly array $reverseList,
         public readonly ?string $source,
         public readonly ?string $storeOrderId,
-        public readonly ?float $totalSum,
+        public readonly ?Money $totalSum,
     ) {
     }
 
@@ -58,7 +59,7 @@ final class OrderShortInfo
             reverseList: $reverseEntries,
             source: is_array($payload) ? ($payload['source'] ?? null) : null,
             storeOrderId: is_array($payload) ? ($payload['store_order_id'] ?? null) : null,
-            totalSum: is_array($payload) && isset($payload['total_sum']) ? (float) $payload['total_sum'] : null,
+            totalSum: Money::tryFromMixed(is_array($payload) ? ($payload['total_sum'] ?? null) : null),
         );
     }
 }

@@ -5,48 +5,36 @@ declare(strict_types=1);
 namespace Inkvizitoria\MonoParts\Support;
 
 use Inkvizitoria\MonoParts\Contracts\SignerInterface;
-use RuntimeException;
+use Inkvizitoria\MonoParts\Security\Signer;
 
+/**
+ * Backward-compatible HMAC signer wrapper.
+ */
 final class HmacSigner implements SignerInterface
 {
+    private readonly Signer $signer;
+
     /**
      * @param string $secret Shared secret provided by monobank for signing.
      * @param string $algo   Hash algorithm (default sha256).
      */
-    public function __construct(
-        private readonly string $secret,
-        private readonly string $algo = 'sha256',
-    ) {
-        if ($secret === '') {
-            throw new RuntimeException('Signature secret is not configured.');
-        }
+    public function __construct(string $secret, string $algo = 'sha256')
+    {
+        $this->signer = new Signer($secret, $algo);
     }
 
-    /**
-     * @param array<string, mixed> $payload
-     */
-    public function sign(array $payload): string
+    public function sign(string $body): string
     {
-        $encoded = $this->encode($payload);
-
-        return base64_encode(hash_hmac($this->algo, $encoded, $this->secret, true));
+        return $this->signer->sign($body);
     }
 
-    /**
-     * @param array<string, mixed> $payload
-     */
-    public function verify(array $payload, string $signature): bool
+    public function verify(string $body, string $signature): bool
     {
-        $expected = $this->sign($payload);
-
-        return hash_equals($expected, $signature);
+        return $this->signer->verify($body, $signature);
     }
 
-    /**
-     * @param array<string, mixed> $payload
-     */
-    private function encode(array $payload): string
+    public function assertValid(string $body, string $signature): void
     {
-        return json_encode($payload, JSON_THROW_ON_ERROR);
+        $this->signer->assertValid($body, $signature);
     }
 }

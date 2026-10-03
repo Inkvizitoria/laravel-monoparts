@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Inkvizitoria\MonoParts\Http\Responses;
 
 use DateTimeImmutable;
+use Inkvizitoria\MonoParts\ValueObjects\Money;
 
 /**
  * Single reverse entry for order short info.
@@ -12,7 +13,7 @@ use DateTimeImmutable;
 final class ReverseEntry
 {
     public function __construct(
-        public readonly ?float $sum,
+        public readonly ?Money $sum,
         public readonly ?DateTimeImmutable $timestamp,
     ) {
     }
@@ -29,7 +30,7 @@ final class ReverseEntry
         }
 
         return new self(
-            sum: isset($payload['sum']) ? (float) $payload['sum'] : null,
+            sum: Money::tryFromMixed($payload['sum'] ?? null),
             timestamp: $timestamp ?: null,
         );
     }
